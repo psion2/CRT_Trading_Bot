@@ -69,7 +69,9 @@ if not na(prevHigh) and not na(prevLow)
     oteHigh := prevLow  + range_ * oteFibHigh
 
 // ─── KOD (Kiss of Death) Detection ──────────────────────────────────────────
-kodSweep     = (tsDirection == 1 or tsDirection == -1) and (ta.barssince(not na(swingHigh)) < swingLen * 2 or ta.barssince(not na(swingLow)) < swingLen * 2)
+barsSinceSH   = ta.barssince(not na(swingHigh))
+barsSinceSL   = ta.barssince(not na(swingLow))
+kodSweep     = (tsDirection == 1 or tsDirection == -1) and (barsSinceSH < swingLen * 2 or barsSinceSL < swingLen * 2)
 kodNearOTE   = not na(oteLow) and (
     (tsDirection ==  1 and low  >= oteLow  and low  <= oteHigh) or
     (tsDirection == -1 and high <= oteHigh and high >= oteLow)
@@ -159,19 +161,27 @@ if showBreaker and breakerCandle and showTradeLvls
 // ─── Table Info ─────────────────────────────────────────────────────────────
 var table infoTbl = table.new(position.bottom_right, 2, 1, bgcolor=color.new(color.black, 80), frame_color=color.gray)
 if barstate.islast
-    table.cell(infoTbl, 0, 0, "CRT Det v1 | Swing " + str.tostring(swingLen), textcolor=color.gray, text_size=size.tiny)
+    table.cell(infoTbl, 0, 0, "CRT Det v1 | Swing " + str.tostring(swingLen), text_color=color.gray, text_size=size.tiny)
 
 // ─── Alerts ─────────────────────────────────────────────────────────────────
 if alertOnSignal and (crtPattern or m1Confirmed or breakerCandle or kissOfDeath)
     msg = ""
-    if crtPattern       and crtDir == 1          ; msg += "CRT BULL "
-    if crtPattern       and crtDir == -1         ; msg += "CRT BEAR "
-    if m1Confirmed      and m1Direction == 1     ; msg += "| M1 BULL "
-    if m1Confirmed      and m1Direction == -1    ; msg += "| M1 BEAR "
-    if breakerCandle    and breakerDir == 1      ; msg += "| BRK BULL "
-    if breakerCandle    and breakerDir == -1     ; msg += "| BRK BEAR "
-    if kissOfDeath      and tsDirection == 1     ; msg += "| KOD BULL "
-    if kissOfDeath      and tsDirection == -1    ; msg += "| KOD BEAR "
+    if crtPattern and crtDir == 1
+        msg := msg + "CRT BULL "
+    if crtPattern and crtDir == -1
+        msg := msg + "CRT BEAR "
+    if m1Confirmed and m1Direction == 1
+        msg := msg + "| M1 BULL "
+    if m1Confirmed and m1Direction == -1
+        msg := msg + "| M1 BEAR "
+    if breakerCandle and breakerDir == 1
+        msg := msg + "| BRK BULL "
+    if breakerCandle and breakerDir == -1
+        msg := msg + "| BRK BEAR "
+    if kissOfDeath and tsDirection == 1
+        msg := msg + "| KOD BULL "
+    if kissOfDeath and tsDirection == -1
+        msg := msg + "| KOD BEAR "
     alert("CRT Signal: " + msg, alert.freq_once_per_bar)
 
 plot(na, "Debug", display=display.none)
