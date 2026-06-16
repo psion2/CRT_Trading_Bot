@@ -1,0 +1,238 @@
+//@version=5
+indicator(
+  title="CRT Pattern Detector",
+  shorttitle="CRT Detector",
+  overlay=true,
+  format=format.price,
+  precision=2
+)
+
+// ─── Inputs ────────────────────────────────────────────────────────────────
+swingLen      = input.int(5,    "Swing Length",          minval=2, maxval=20)
+minBodyRatio  = input.float(1.5,"Min Model-1 Body Ratio", minval=0.5, step=0.1)
+oteFibLow     = input.float(0.60,"OTE Fib Low",           minval=0.0, step=0.05)
+oteFibHigh    = input.float(0.75,"OTE Fib High",          minval=0.0, step=0.05)
+showCRT       = input.bool(true, "Show CRT Ranges")
+showTS        = input.bool(true, "Show Turtle Soup")
+showM1        = input.bool(true, "Show Model-1")
+showBreaker   = input.bool(true, "Show Breaker Blocks")
+showOTE       = input.bool(true, "Show OTE Zones")
+showKOD       = input.bool(true, "Show KOD")
+showTradeLvls = input.bool(true, "Show Entry/SL/TP")
+alertOnSignal = input.bool(true, "Alert on New Signal")
+
+// ─── Swing Highs / Lows ─────────────────────────────────────────────────────
+swingHigh = ta.pivothigh(high, swingLen, swingLen)
+swingLow  = ta.pivotlow(low,   swingLen, swingLen)
+
+var float lastSwingHigh = na
+var float lastSwingLow  = na
+var int   lastSHBar     = -1
+var int   lastSLBar     = -1
+
+if not na(swingHigh)
+    lastSwingHigh := swingHigh
+    lastSHBar     := bar_index
+if not na(swingLow)
+    lastSwingLow  := swingLow
+    lastSLBar     := bar_index
+
+// ─── Candle Body Utility ────────────────────────────────────────────────────
+bodySize     = math.abs(close - open)
+bodyHigh     = math.max(close, open)
+bodyLow      = math.min(close, open)
+upperWick    = high - bodyHigh
+lowerWick    = bodyLow - low
+totalRange   = high - low
+bodyRatio    = bodySize / (totalRange > 0 ? totalRange : 1)
+isThickBull  = close > open and bodyRatio >= 0.6
+isThickBear  = open > close and bodyRatio >= 0.6
+isThick      = isThickBull or isThickBear
+
+// ─── Swing Levels ──────────────────────────────────────────────────────────
+// Use highest/lowest over recent bars for current candle comparison
+lookback     = swingLen * 4
+recentHigh   = ta.highest(high, lookback)
+recentLow    = ta.lowest(low,  lookback)
+prevHigh     = ta.valuewhen(not na(swingHigh), swingHigh, 1)
+prevLow      = ta.valuewhen(not na(swingLow),  swingLow,  1)
+prevHighBar  = ta.valuewhen(not na(swingHigh), bar_index,  1)
+prevLowBar   = ta.valuewhen(not na(swingLow),  bar_index,  1)
+
+// ─── Turtle Soup Detection ─────────────────────────────────────────────────
+// Bullish TS: price sweeps below prev swing low, closes back above
+tsLowSweep   = low  <= prevLow  and close > prevLow
+tsHighSweep  = high >= prevHigh and close < prevHigh
+turtleSoup   = tsLowSweep or tsHighSweep
+tsDirection  = tsLowSweep ? 1 : tsHighSweep ? -1 : 0  // 1=bullish, -1=bearish
+
+// ─── CRT 3-Candle Range Detection ──────────────────────────────────────────
+// Candle 1: forms a range (wide range candle)
+// Candle 2: sweeps one side (manipulation)
+// Candle 3: expands to opposite side (distribution)
+candle1Range = high[2] - low[2]
+candle2Sweep = (high[1] > high[2] and close[1] < high[2]) or (low[1] < low[2] and close[1] > low[2])
+candle3Exp   = (close > high[1] and high[1] < high[2]) or (close < low[1] and low[1] > low[2])
+candle3Dir   = (close > high[1] and high[1] < high[2]) ? 1 : (close < low[1] and low[1] > low[2]) ? -1 : 0
+
+crtPattern   = candle1Range > 0 and candle2Sweep and candle3Exp
+crtDir       = candle3Dir
+
+// ─── Model-1 Detection ─────────────────────────────────────────────────────
+// A thick candle that swept a level, followed by close confirmation
+m1SweepHigh  = high >= prevHigh and close <= bodyLow
+m1SweepLow   = low  <= prevLow  and close >= bodyHigh
+m1Sweep      = m1SweepHigh or m1SweepLow
+m1Thick      = isThick and bodyRatio >= minBodyRatio
+model1Candle = m1Thick and m1Sweep
+m1Direction  = m1SweepLow ? 1 : m1SweepHigh ? -1 : 0  // 1=bullish, -1=bearish
+
+// Model-1 confirmation: next candle closes in the expected direction
+m1Confirmed  = model1Candle and (
+    (m1Direction ==  1 and close > high[1]) or
+    (m1Direction == -1 and close < low[1])
+)
+
+// ─── OTE Zone (Fibonacci 60-75%) ────────────────────────────────────────────
+// Find the most recent significant swing + a displacement move
+var float oteLow  = na
+var float oteHigh = na
+var int   oteBar  = -1
+
+// Displacement: a strong move after turtle soup
+displacementHigh = not na(swingHigh) and ta.barssince(not na(swingLow)) < lookback
+displacementLow  = not na(swingLow)  and ta.barssince(not na(swingHigh)) < lookback
+
+// When we have a clear swing high and low, compute OTE zone
+if not na(prevHigh) and not na(prevLow)
+    range_  = prevHigh - prevLow
+    // Bullish OTE: after low sweep, retracement from low to high
+    // Bearish OTE: after high sweep, retracement from high to low
+    oteLow  := prevLow  + range_ * oteFibLow
+    oteHigh := prevLow  + range_ * oteFibHigh
+
+// ─── KOD (Kiss of Death) Detection ──────────────────────────────────────────
+// Final sweep before hitting target. Usually near the OTE zone or
+// in the lower 25% of the range.
+kodSweep     = turtleSoup and (ta.barssince(not na(swingHigh)) < swingLen * 2 or ta.barssince(not na(swingLow)) < swingLen * 2)
+kodNearOTE   = not na(oteLow) and (
+    (tsDirection ==  1 and low  >= oteLow  and low  <= oteHigh) or
+    (tsDirection == -1 and high <= oteHigh and high >= oteLow)
+)
+kissOfDeath  = kodSweep and kodNearOTE
+kodDirection = tsDirection
+
+// ─── Breaker Block Detection ────────────────────────────────────────────────
+// After Model-1, the last candle before displacement becomes breaker
+// When price retests that candle, it's a breaker entry
+breakerCandle = model1Candle[1] and (
+    (m1Direction[1] ==  1 and low  <= low[1]  and close > low[1]) or
+    (m1Direction[1] == -1 and high >= high[1] and close < high[1])
+)
+breakerDir    = m1Direction[1]
+
+// ─── Entry / SL / TP Lines ──────────────────────────────────────────────────
+// For detected patterns, draw trade levels
+var line   entryLine  = na
+var line   slLine     = na
+var line   tp1Line    = na
+var line   tp2Line    = na
+var label  sigLabel   = na
+
+drawTradeLevels(dir, entry, sl, entryBar, labelText, color_) =>
+    if showTradeLvls and not na(entry) and not na(sl)
+        entryLine := line.new(entryBar, entry, bar_index + 2, entry,
+          color=color_, width=1, style=line.style_dashed, extend=extend.right)
+        slLine    := line.new(entryBar, sl,    bar_index + 2, sl,
+          color=color.new(color.red, 30), width=1, style=line.style_dashed, extend=extend.right)
+        // TP: 1.5R and 2.0R
+        risk_     = math.abs(entry - sl)
+        tp1_      = dir == 1 ? entry + risk_ * 1.5 : entry - risk_ * 1.5
+        tp2_      = dir == 1 ? entry + risk_ * 2.0 : entry - risk_ * 2.0
+        tp1Line   := line.new(entryBar, tp1_, bar_index + 2, tp1_,
+          color=color.new(color.green, 40), width=1, style=line.style_dotted, extend=extend.right)
+        tp2Line   := line.new(entryBar, tp2_, bar_index + 2, tp2_,
+          color=color.new(color.lime, 30), width=1, style=line.style_dotted, extend=extend.right)
+        sigLabel  := label.new(entryBar, max(high, entry) + ta.atr(14) * 0.5,
+          labelText, color=color_, style=label.style_label_down,
+          textcolor=color.white, size=size.small)
+
+// ─── Visual Markers ────────────────────────────────────────────────────────
+
+// Plot swing levels
+plotshape(showCRT and not na(swingHigh), "Swing High", shape.triangledown, location.abovebar, color.orange, size=size.tiny)
+plotshape(showCRT and not na(swingLow),  "Swing Low",  shape.triangleup,   location.belowbar, color.orange, size=size.tiny)
+
+// Plot CRT patterns
+plotshape(showCRT and crtPattern and crtDir == 1, "CRT Bull", shape.arrowup,   location.belowbar, color.blue,  size=size.normal)
+plotshape(showCRT and crtPattern and crtDir == -1,"CRT Bear", shape.arrowdown, location.abovebar, color.blue,  size=size.normal)
+
+// Plot Turtle Soup
+plotshape(showTS and tsLowSweep,  "TS Bull", shape.diamond, location.belowbar, color.green, size=size.small)
+plotshape(showTS and tsHighSweep, "TS Bear", shape.diamond, location.abovebar, color.red,   size=size.small)
+
+// Plot Model-1
+plotshape(showM1 and model1Candle and m1Direction == 1, "M1 Bull", shape.square, location.belowbar, color.lime, size=size.small)
+plotshape(showM1 and model1Candle and m1Direction == -1,"M1 Bear", shape.square, location.abovebar, color.maroon, size=size.small)
+
+// Plot Breaker
+plotshape(showBreaker and breakerCandle and breakerDir == 1, "Breaker Bull", shape.cross, location.belowbar, color.teal,  size=size.tiny)
+plotshape(showBreaker and breakerCandle and breakerDir == -1,"Breaker Bear", shape.cross, location.abovebar, color.purple, size=size.tiny)
+
+// Plot KOD
+plotshape(showKOD and kissOfDeath and kodDirection == 1, "KOD Bull", shape.xcross, location.belowbar, color.yellow, size=size.small)
+plotshape(showKOD and kissOfDeath and kodDirection == -1,"KOD Bear", shape.xcross, location.abovebar, color.yellow, size=size.small)
+
+// ─── OTE Zone Box ───────────────────────────────────────────────────────────
+var box oteBox = na
+if showOTE and not na(oteLow) and not na(oteHigh)
+    oteBox := box.new(
+      bar_index - lookback, oteHigh,
+      bar_index,            oteLow,
+      bgcolor=color.new(color.aqua, 90),
+      border_color=color.new(color.aqua, 70),
+      border_width=1, text="OTE Zone", textcolor=color.aqua, text_size=size.tiny
+    )
+
+// ─── Trade Level Labels ─────────────────────────────────────────────────────
+// Show entry/SL/TP labels for confirmed patterns
+
+// On Model-1 confirmed: draw entry at candle low (bull) or high (bear)
+if showM1 and m1Confirmed
+    entry_ = m1Direction == 1 ? low[1] : high[1]
+    sl_    = m1Direction == 1 ? low[1] - ta.atr(14) * 0.5 : high[1] + ta.atr(14) * 0.5
+    label_ = m1Direction == 1 ? "M1 LONG" : "M1 SHORT"
+    drawTradeLevels(m1Direction, entry_, sl_, bar_index - 1, label_, m1Direction == 1 ? color.lime : color.red)
+
+// On CRT pattern: draw entry at candle 3 open
+if showCRT and crtPattern and showTradeLvls
+    entry_ = crtDir == 1 ? low[2] : high[2]
+    sl_    = crtDir == 1 ? low[2] - ta.atr(14) * 0.5 : high[2] + ta.atr(14) * 0.5
+    label_ = crtDir == 1 ? "CRT LONG" : "CRT SHORT"
+    drawTradeLevels(crtDir, entry_, sl_, bar_index, label_, crtDir == 1 ? color.blue : color.orange)
+
+// On Breaker: draw entry at breaker candle body
+if showBreaker and breakerCandle
+    entry_ = breakerDir == 1 ? bodyLow[1] : bodyHigh[1]
+    sl_    = breakerDir == 1 ? low[1] - ta.atr(14) * 0.5 : high[1] + ta.atr(14) * 0.5
+    label_ = breakerDir == 1 ? "BREAKER LONG" : "BREAKER SHORT"
+    drawTradeLevels(breakerDir, entry_, sl_, bar_index - 1, label_, breakerDir == 1 ? color.teal : color.purple)
+
+// ─── Table Info ─────────────────────────────────────────────────────────────
+var table infoTbl = table.new(position.bottom_right, 2, 1, bgcolor=color.new(color.black, 80), frame_color=color.gray)
+if barstate.islast
+    info = "CRT Detector v1 | Swing Len=" + str.tostring(swingLen)
+    table.cell(infoTbl, 0, 0, info, textcolor=color.gray, text_size=size.tiny)
+
+// ─── Alerts ─────────────────────────────────────────────────────────────────
+if alertOnSignal and (crtPattern or m1Confirmed or breakerCandle or kissOfDeath)
+    alert("CRT Signal: " +
+      (crtPattern     ? "CRT "     + (crtDir == 1 ? "BULL" : "BEAR") : "") +
+      (m1Confirmed    ? " | M1 "     + (m1Direction == 1 ? "BULL" : "BEAR") : "") +
+      (breakerCandle  ? " | BREAKER " + (breakerDir == 1 ? "BULL" : "BEAR") : "") +
+      (kissOfDeath    ? " | KOD "    + (kodDirection == 1 ? "BULL" : "BEAR") : ""),
+      alert.freq_once_per_bar)
+
+// ─── Debug Plot (hidden, for validation) ────────────────────────────────────
+// Useful for troubleshooting against known CRT setups
+plot(na, "Debug", display=display.none)
