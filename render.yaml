@@ -1,0 +1,40 @@
+services:
+  - type: web
+    name: crt-trading-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r render/requirements.txt
+    startCommand: python -m render.app
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: EXCHANGE_ID
+        value: kucoin
+      - key: SYMBOL
+        value: BTC/USDT
+      - key: ENTRY_MODE
+        value: limit_retest
+      - key: USE_LTF
+        value: "false"
+      - key: INITIAL_CAPITAL
+        value: "10000"
+      - key: RISK_PER_TRADE
+        value: "0.02"
+      - key: FEE_RATE
+        value: "0.0004"
+      - key: STOP_LOSS_PCT
+        value: "0.02"
+      - key: TP1
+        value: "1.5"
+      - key: TP2
+        value: "2.0"
+      - key: ENTRY_LOGIC
+        value: extreme
+      - key: POLL_INTERVAL
+        value: "60"
+      - fromGroup: database
+
+databases:
+  - name: crt-trading-db
+    plan: free
+    region: oregon
