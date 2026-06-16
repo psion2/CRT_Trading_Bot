@@ -1,11 +1,5 @@
-//@version=5
-indicator(
-  title="CRT Pattern Detector",
-  shorttitle="CRT Detector",
-  overlay=true,
-  format=format.price,
-  precision=2
-)
+//@version=6
+indicator(title="CRT Pattern Detector", shorttitle="CRT Det", overlay=true, format=format.price, precision=2)
 
 // ─── Inputs ────────────────────────────────────────────────────────────────
 swingLen      = input.int(5,    "Swing Length",          minval=2, maxval=20)
