@@ -475,6 +475,7 @@ class PaperTrader:
             "symbol": self.symbol,
             "signal_time": signal_time,
             "entry_time": datetime.now(),
+            "entry_price": entry_price,
             "direction": direction,
             "position_size": position_size,
             "stop_loss": sl,

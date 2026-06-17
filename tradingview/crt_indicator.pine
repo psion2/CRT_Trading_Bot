@@ -1,187 +1,464 @@
 //@version=6
-indicator(title="CRT Pattern Detector", shorttitle="CRT Det", overlay=true, format=format.price, precision=2)
+indicator(title="CRT Pattern Detector (MTF)", shorttitle="CRT Det MTF", overlay=true, format=format.price, precision=2)
 
-// ─── Inputs ────────────────────────────────────────────────────────────────
-swingLen      = input.int(5,    "Swing Length",          minval=2, maxval=20)
-minBodyRatio  = input.float(1.5,"Min Model-1 Body Ratio", minval=0.5, step=0.1)
-oteFibLow     = input.float(0.60,"OTE Fib Low",           minval=0.0, step=0.05)
-oteFibHigh    = input.float(0.75,"OTE Fib High",          minval=0.0, step=0.05)
-showCRT       = input.bool(true, "Show CRT Ranges")
-showTS        = input.bool(true, "Show Turtle Soup")
-showM1        = input.bool(true, "Show Model-1")
-showBreaker   = input.bool(true, "Show Breaker Blocks")
-showOTE       = input.bool(true, "Show OTE Zones")
-showKOD       = input.bool(true, "Show KOD")
-showTradeLvls = input.bool(true, "Show Entry/SL/TP")
-alertOnSignal = input.bool(true, "Alert on New Signal")
+// ─── Inputs: Core ──────────────────────────────────────────────────────────
+swingLen      = input.int(5,    "Swing Length",          minval=2, maxval=20, group="Core")
+minBodyRatio  = input.float(1.5,"Min Model-1 Body Ratio", minval=0.5, step=0.1, group="Core")
+oteFibLow     = input.float(0.60,"OTE Fib Low",           minval=0.0, step=0.05, group="Core")
+oteFibHigh    = input.float(0.75,"OTE Fib High",          minval=0.0, step=0.05, group="Core")
+htfRes        = input.string("240", "HTF Resolution",     options=["60","120","240","480","D"], group="Core")
 
-// ─── Candle Body Utility ────────────────────────────────────────────────────
-bodySize     = math.abs(close - open)
-bodyHigh     = math.max(close, open)
-bodyLow      = math.min(close, open)
-totalRange   = high - low
-bodyRatio    = bodySize / (totalRange > 0 ? totalRange : 1)
-isThickBull  = close > open and bodyRatio >= 0.6
-isThickBear  = open > close and bodyRatio >= 0.6
-isThick      = isThickBull or isThickBear
-atrVal       = ta.atr(14)
+// ─── Inputs: Display Toggles ──────────────────────────────────────────────
+showCRT       = input.bool(true,  "Show 4H CRT Patterns",          group="Display")
+showTS        = input.bool(true,  "Show 15M Turtle Soup",          group="Display")
+showM1        = input.bool(true,  "Show 15M Model-1",              group="Display")
+showBreaker   = input.bool(true,  "Show 15M Breaker",              group="Display")
+showOTE       = input.bool(true,  "Show OTE Zones",                group="Display")
+showKOD       = input.bool(true,  "Show KOD",                      group="Display")
+showTradeLvls = input.bool(true,  "Show Entry/SL/TP",              group="Display")
+show4HBoxes   = input.bool(true,  "Show 4H Range Boxes",           group="Display")
+alertOnSignal = input.bool(true,  "Alert on New Signal",           group="Display")
+showEntryTrig = input.bool(true,  "Show 15M Entry Triggers",       group="Display")
+lookback      = input.int(30,    "OTE Box Lookback",              minval=10, maxval=100, group="Display")
 
-// ─── Swing Highs / Lows ─────────────────────────────────────────────────────
-swingHigh = ta.pivothigh(high, swingLen, swingLen)
-swingLow  = ta.pivotlow(low,   swingLen, swingLen)
+// ─── Inputs: Kill Zones ───────────────────────────────────────────────────
+enableKZ      = input.bool(false, "Enable Kill Zone Filter",      group="Kill Zones")
+kzWarn        = input.bool(true,  "Warn on Outside-KZ Signals",   group="Kill Zones")
+showKZShade   = input.bool(true,  "Shade Kill Zone Hours",        group="Kill Zones")
 
-// ─── Swing Levels ──────────────────────────────────────────────────────────
-lookback     = swingLen * 4
-prevHigh     = ta.valuewhen(not na(swingHigh), swingHigh, 1)
-prevLow      = ta.valuewhen(not na(swingLow),  swingLow,  1)
+// ─── Inputs: Draw Liquidity Priority ──────────────────────────────────────
+enableDLP     = input.bool(false, "Enable Draw Liquidity Priority", group="Draw Liquidity")
 
-// ─── Turtle Soup Detection ─────────────────────────────────────────────────
-tsLowSweep   = low  <= prevLow  and close > prevLow
-tsHighSweep  = high >= prevHigh and close < prevHigh
-tsDirection  = tsLowSweep ? 1 : tsHighSweep ? -1 : 0
+// ─── Inputs: Day Filter ───────────────────────────────────────────────────
+dayFilter     = input.string("any", "Day Filter",
+   options=["any", "thu_fri", "mon_fri"], group="Day Filter")
 
-// ─── CRT 3-Candle Range Detection ──────────────────────────────────────────
-candle2Sweep = (high[1] > high[2] and close[1] < high[2]) or (low[1] < low[2] and close[1] > low[2])
-candle3Exp   = (close > high[1] and high[1] < high[2]) or (close < low[1] and low[1] > low[2])
-candle3Dir   = (close > high[1] and high[1] < high[2]) ? 1 : (close < low[1] and low[1] > low[2]) ? -1 : 0
-crtPattern   = candle2Sweep and candle3Exp
-crtDir       = candle3Dir
+// ─── Inputs: Extra CRT Types ──────────────────────────────────────────────
+show2Candle   = input.bool(true,  "Show 2-Candle CRT",            group="Extra CRT Types")
+showInsideBar = input.bool(true,  "Show Inside-Bar CRT",          group="Extra CRT Types")
+insideBarLen  = input.int(3,      "Min Inside-Bar Candles", minval=2, maxval=20, group="Extra CRT Types")
 
-// ─── Model-1 Detection ─────────────────────────────────────────────────────
-m1SweepHigh  = high >= prevHigh and close <= bodyLow
-m1SweepLow   = low  <= prevLow  and close >= bodyHigh
-m1Sweep      = m1SweepHigh or m1SweepLow
-m1Thick      = isThick and bodyRatio >= minBodyRatio
-model1Candle = m1Thick and m1Sweep
-m1Direction  = m1SweepLow ? 1 : m1SweepHigh ? -1 : 0
+// ══════════════════════════════════════════════════════════════════════════
+//  PART 1: 4H (HTF) DATA FETCHING AND PATTERN DETECTION
+// ══════════════════════════════════════════════════════════════════════════
 
-m1Confirmed  = model1Candle and (
-    (m1Direction ==  1 and close > high[1]) or
-    (m1Direction == -1 and close < low[1])
+// Fetch 4H time for new-candle detection
+htfT = request.security(syminfo.tickerid, htfRes, time)
+
+// Fetch previous 4H candle OHLC for array storage
+[htfO1, htfH1, htfL1, htfC1] = request.security(syminfo.tickerid, htfRes,
+    [open[1], high[1], low[1], close[1]])
+
+// Detect new 4H candle (time changes)
+isNew4H = ta.change(htfT) != 0
+
+// Store last N 4H candles in arrays
+var array<float> h4Opens   = array.new<float>(0)
+var array<float> h4Highs   = array.new<float>(0)
+var array<float> h4Lows    = array.new<float>(0)
+var array<float> h4Closes  = array.new<float>(0)
+
+if isNew4H
+    array.unshift(h4Opens,  htfO1)
+    array.unshift(h4Highs,  htfH1)
+    array.unshift(h4Lows,   htfL1)
+    array.unshift(h4Closes, htfC1)
+    while array.size(h4Opens) > 100
+        array.pop(h4Opens)
+        array.pop(h4Highs)
+        array.pop(h4Lows)
+        array.pop(h4Closes)
+
+// ─── 4H: Candle Body Utility ──────────────────────────────────────────────
+getRange(arrH, arrL, i)  => array.get(arrH, i) - array.get(arrL, i)
+getBody(arrO, arrC, i)   => math.abs(array.get(arrC, i) - array.get(arrO, i))
+getBodyPct(arrO, arrH, arrL, arrC, i) =>
+    r = getRange(arrH, arrL, i)
+    getBody(arrO, arrC, i) / (r > 0 ? r : 1)
+getDir(arrO, arrC, i)    => array.get(arrC, i) > array.get(arrO, i) ? 1 : -1
+
+// ─── 4H: Pattern Detection ───────────────────────────────────────────────
+// Need at least 3 HTF candles in array
+has4HData = array.size(h4Closes) >= 3
+
+// All detection uses array data (completed candles only)
+c1H = has4HData ? array.get(h4Highs, 2) : na
+c1L = has4HData ? array.get(h4Lows, 2) : na
+c2H = has4HData ? array.get(h4Highs, 1) : na
+c2L = has4HData ? array.get(h4Lows, 1) : na
+c2C = has4HData ? array.get(h4Closes, 1) : na
+c3H = has4HData ? array.get(h4Highs, 0) : na
+c3L = has4HData ? array.get(h4Lows, 0) : na
+c3C = has4HData ? array.get(h4Closes, 0) : na
+c3O = has4HData ? array.get(h4Opens, 0) : na
+
+// Standard 1-2-3 CRT
+htfC2Sweep = (c2H > c1H and c2C < c1H) or (c2L < c1L and c2C > c1L)
+htfC3Exp   = (c3C > c2H and c2H < c1H and c3C > c1H) or (c3C < c2L and c2L > c1L and c3C < c1L)
+htfCRT     = has4HData and htfC2Sweep and htfC3Exp
+htfCRTDir  = htfC3Exp ? (c3C > c2H ? 1 : -1) : 0
+
+// 2-Candle CRT: C1 at array[1], C2 at array[0] sweeps + distributes
+c1H2 = has4HData ? array.get(h4Highs, 1) : na
+c1L2 = has4HData ? array.get(h4Lows, 1) : na
+c2H2 = has4HData ? array.get(h4Highs, 0) : na
+c2L2 = has4HData ? array.get(h4Lows, 0) : na
+c2C2 = has4HData ? array.get(h4Closes, 0) : na
+htf2Candle = (c2L2 < c1L2 and c2C2 > c1H2) or (c2H2 > c1H2 and c2C2 < c1L2)
+htf2CDir   = (c2L2 < c1L2 and c2C2 > c1H2) ? 1 : (c2H2 > c1H2 and c2C2 < c1L2) ? -1 : 0
+
+// Inside-Bar CRT: scan back for range candle + inside candles + breakout
+htfIBCRT  = false
+htfIBDir  = 0
+htfIBHigh = float(na)
+htfIBLow  = float(na)
+if has4HData and array.size(h4Highs) >= 4
+    for b = 3 to math.min(15, array.size(h4Highs) - 1)
+        rHigh = array.get(h4Highs, b)
+        rLow  = array.get(h4Lows,  b)
+        // Check if candles 1 up to b-1 are inside the range
+        allInside = true
+        inCount = 0
+        for j = 1 to b - 1
+            jHigh = array.get(h4Highs, j)
+            jLow  = array.get(h4Lows,  j)
+            if jHigh <= rHigh and jLow >= rLow
+                inCount += 1
+            else
+                allInside := false
+                break
+        if allInside and inCount >= insideBarLen
+            // Candle at index 0 (current) breaks out
+            c0High = array.get(h4Highs, 0)
+            c0Low  = array.get(h4Lows,  0)
+            if c0High > rHigh
+                htfIBCRT  := true
+                htfIBDir  := 1
+                htfIBHigh := rHigh
+                htfIBLow  := rLow
+            if c0Low < rLow
+                htfIBCRT  := true
+                htfIBDir  := -1
+                htfIBHigh := rHigh
+                htfIBLow  := rLow
+            if htfIBCRT
+                break
+
+// ─── 4H: Signal State ─────────────────────────────────────────────────────
+var int   htfSignalDir   = 0
+var float htfEntryLevel  = na
+var float htfSLLevel     = na
+var string htfPhase      = ""
+var int   htfSignalBar   = -1
+
+// Update on new 4H candle
+if isNew4H
+    htfSignalDir  := 0
+    htfEntryLevel := na
+    htfSLLevel    := na
+    htfPhase      := ""
+    htfSignalBar  := -1
+
+    if htfCRT and htfCRTDir != 0
+        htfSignalDir  := htfCRTDir
+        htfEntryLevel := htfCRTDir == 1 ? c1L : c1H  // entry at C1 extreme
+        htfSLLevel    := htfCRTDir == 1 ? c2L : c2H  // SL at C2 extreme
+        htfPhase      := "CRT"
+        htfSignalBar  := bar_index
+    else if show2Candle and htf2Candle and htf2CDir != 0
+        htfSignalDir  := htf2CDir
+        htfEntryLevel := c2C2  // entry at C2 close (distribution)
+        htfSLLevel    := htf2CDir == 1 ? c2L2 : c2H2  // SL at C2 sweep extreme
+        htfPhase      := "2C"
+        htfSignalBar  := bar_index
+    else if showInsideBar and htfIBCRT and htfIBDir != 0
+        htfSignalDir  := htfIBDir
+        htfEntryLevel := htfIBDir == 1 ? htfIBLow : htfIBHigh
+        htfSLLevel    := htfIBDir == 1 ? array.get(h4Lows, 0) : array.get(h4Highs, 0)
+        htfPhase      := "IB"
+        htfSignalBar  := bar_index
+
+// ══════════════════════════════════════════════════════════════════════════
+//  PART 2: 15M (LTF) PATTERN DETECTION
+// ══════════════════════════════════════════════════════════════════════════
+
+// ─── 15M: Candle Utility ──────────────────────────────────────────────────
+ltfBody     = math.abs(close - open)
+ltfBodyHigh = math.max(close, open)
+ltfBodyLow  = math.min(close, open)
+ltfRange    = high - low
+ltfBodyPct  = ltfBody / (ltfRange > 0 ? ltfRange : 1)
+ltfThick    = ltfBodyPct >= 0.6
+ltfDir      = close > open ? 1 : -1
+ltfATR      = ta.atr(14)
+
+// ─── 15M: Swing Points ────────────────────────────────────────────────────
+ltfSwingHigh = ta.pivothigh(high, swingLen, swingLen)
+ltfSwingLow  = ta.pivotlow(low,   swingLen, swingLen)
+ltfPrevHigh  = ta.valuewhen(not na(ltfSwingHigh), ltfSwingHigh, 1)
+ltfPrevLow   = ta.valuewhen(not na(ltfSwingLow),  ltfSwingLow,  1)
+
+// ─── 15M: Turtle Soup ─────────────────────────────────────────────────────
+ltfTSLowSweep  = low  <= ltfPrevLow  and close > ltfPrevLow
+ltfTSHighSweep = high >= ltfPrevHigh and close < ltfPrevHigh
+ltfTSDir       = ltfTSLowSweep ? 1 : ltfTSHighSweep ? -1 : 0
+
+// ─── 15M: Model-1 ────────────────────────────────────────────────────────
+ltfM1Sweep  = (high >= ltfPrevHigh and close <= ltfBodyLow) or
+              (low  <= ltfPrevLow  and close >= ltfBodyHigh)
+ltfM1Thick  = ltfThick and ltfBodyPct >= minBodyRatio
+ltfM1Candle = ltfM1Thick and ltfM1Sweep
+ltfM1Dir    = (low <= ltfPrevLow and close >= ltfBodyHigh) ? 1 :
+              (high >= ltfPrevHigh and close <= ltfBodyLow) ? -1 : 0
+ltfM1Confirmed = ltfM1Candle and (
+    (ltfM1Dir ==  1 and close > high[1]) or
+    (ltfM1Dir == -1 and close < low[1])
 )
 
-// ─── OTE Zone (Fibonacci 60-75%) ────────────────────────────────────────────
-var float oteLow  = na
-var float oteHigh = na
-if not na(prevHigh) and not na(prevLow)
-    range_  = prevHigh - prevLow
-    oteLow  := prevLow  + range_ * oteFibLow
-    oteHigh := prevLow  + range_ * oteFibHigh
+// ─── 15M: OTE Zone ────────────────────────────────────────────────────────
+var float ltfOTELow  = na
+var float ltfOTEHigh = na
+if not na(ltfPrevHigh) and not na(ltfPrevLow)
+    rng_  = ltfPrevHigh - ltfPrevLow
+    ltfOTELow  := ltfPrevLow  + rng_ * oteFibLow
+    ltfOTEHigh := ltfPrevLow  + rng_ * oteFibHigh
 
-// ─── KOD (Kiss of Death) Detection ──────────────────────────────────────────
-barsSinceSH   = ta.barssince(not na(swingHigh))
-barsSinceSL   = ta.barssince(not na(swingLow))
-kodSweep     = (tsDirection == 1 or tsDirection == -1) and (barsSinceSH < swingLen * 2 or barsSinceSL < swingLen * 2)
-kodNearOTE   = not na(oteLow) and (
-    (tsDirection ==  1 and low  >= oteLow  and low  <= oteHigh) or
-    (tsDirection == -1 and high <= oteHigh and high >= oteLow)
+// ─── 15M: KOD ─────────────────────────────────────────────────────────────
+ltfBarsSH = ta.barssince(not na(ltfSwingHigh))
+ltfBarsSL = ta.barssince(not na(ltfSwingLow))
+ltfKODSweep = (ltfTSDir == 1 or ltfTSDir == -1) and (ltfBarsSH < swingLen * 2 or ltfBarsSL < swingLen * 2)
+ltfKODNearOTE = not na(ltfOTELow) and (
+    (ltfTSDir ==  1 and low  >= ltfOTELow  and low  <= ltfOTEHigh) or
+    (ltfTSDir == -1 and high <= ltfOTEHigh and high >= ltfOTELow)
 )
-kissOfDeath  = kodSweep and kodNearOTE
+ltfKOD = ltfKODSweep and ltfKODNearOTE
 
-// ─── Breaker Block Detection ────────────────────────────────────────────────
-breakerCandle = model1Candle[1] and (
-    (m1Direction[1] ==  1 and low  <= low[1]  and close > low[1]) or
-    (m1Direction[1] == -1 and high >= high[1] and close < high[1])
+// ─── 15M: Breaker ─────────────────────────────────────────────────────────
+ltfBreaker = ltfM1Candle[1] and (
+    (ltfM1Dir[1] ==  1 and low  <= low[1]  and close > low[1]) or
+    (ltfM1Dir[1] == -1 and high >= high[1] and close < high[1])
 )
-breakerDir    = m1Direction[1]
+ltfBreakerDir = ltfM1Dir[1]
 
-// ─── Visual Markers ────────────────────────────────────────────────────────
-plotshape(showCRT and not na(swingHigh), "Swing High", shape.triangledown, location.abovebar, color.orange, size=size.tiny)
-plotshape(showCRT and not na(swingLow),  "Swing Low",  shape.triangleup,   location.belowbar, color.orange, size=size.tiny)
+// ══════════════════════════════════════════════════════════════════════════
+//  PART 3: 15M ENTRY TRIGGER (4H pattern + 15M confirmation)
+// ══════════════════════════════════════════════════════════════════════════
 
-plotshape(showCRT and crtPattern and crtDir == 1, "CRT Bull", shape.arrowup,   location.belowbar, color.blue,  size=size.normal)
-plotshape(showCRT and crtPattern and crtDir == -1,"CRT Bear", shape.arrowdown, location.abovebar, color.blue,  size=size.normal)
+// A 4H signal is "active" for its 4-hour duration (16 x 15M bars)
+var int   activeHTFSignal = 0
+var float activeEntry     = na
+var float activeSL        = na
+var int   activeSignalBar = -1
+var int   activeStartBar  = -1
 
-plotshape(showTS and tsLowSweep,  "TS Bull", shape.diamond, location.belowbar, color.green, size=size.small)
-plotshape(showTS and tsHighSweep, "TS Bear", shape.diamond, location.abovebar, color.red,   size=size.small)
+if isNew4H
+    if htfSignalDir != 0
+        activeHTFSignal := htfSignalDir
+        activeEntry     := htfEntryLevel
+        activeSL        := htfSLLevel
+        activeSignalBar := htfSignalBar
+        activeStartBar  := bar_index
 
-plotshape(showM1 and model1Candle and m1Direction == 1, "M1 Bull", shape.square, location.belowbar, color.lime, size=size.small)
-plotshape(showM1 and model1Candle and m1Direction == -1,"M1 Bear", shape.square, location.abovebar, color.maroon, size=size.small)
+// Clear after 4 hours (16 x 15M bars) or next 4H signal
+if not isNew4H and activeStartBar > 0 and bar_index - activeStartBar > 16
+    activeHTFSignal := 0
+    activeEntry     := na
+    activeSL        := na
+    activeSignalBar := -1
+    activeStartBar  := -1
 
-plotshape(showBreaker and breakerCandle and breakerDir == 1, "Brk Bull", shape.cross, location.belowbar, color.teal,  size=size.tiny)
-plotshape(showBreaker and breakerCandle and breakerDir == -1,"Brk Bear", shape.cross, location.abovebar, color.purple, size=size.tiny)
+// 15M triggers: Model-1 at entry, or LTF close crossing entry level
+// Only trigger if signal is still fresh (< 16 bars old)
+triggerFresh = activeStartBar > 0 and bar_index - activeStartBar < 16
+triggerM1    = activeHTFSignal != 0 and triggerFresh and ltfM1Confirmed and ltfM1Dir == activeHTFSignal
+triggerPrice = activeHTFSignal != 0 and triggerFresh and not na(activeEntry) and (
+    (activeHTFSignal == 1 and close > activeEntry) or
+    (activeHTFSignal == -1 and close < activeEntry)
+)
+// Only trigger once per 4H signal
+var bool triggerFired = false
+if isNew4H
+    triggerFired := false
+triggerNow = (triggerM1 or triggerPrice) and not triggerFired
+if triggerNow
+    triggerFired := true
 
-plotshape(showKOD and kissOfDeath and tsDirection == 1, "KOD Bull", shape.xcross, location.belowbar, color.yellow, size=size.small)
-plotshape(showKOD and kissOfDeath and tsDirection == -1,"KOD Bear", shape.xcross, location.abovebar, color.yellow, size=size.small)
+// ══════════════════════════════════════════════════════════════════════════
+//  PART 4: KILL ZONES, DLP, DAY FILTER
+// ══════════════════════════════════════════════════════════════════════════
 
-// ─── OTE Zone Box ───────────────────────────────────────────────────────────
+kzLondon   = hour >= 2 and hour < 5
+kzNewYork  = hour >= 7 and hour < 10
+inKillZone = kzLondon or kzNewYork
+
+var int drawDirection  = 0
+var int drawBarIndex   = -1
+
+if enableDLP
+    if ltfTSDir != 0
+        drawDirection := ltfTSDir
+        drawBarIndex   := bar_index
+    if triggerNow
+        drawDirection := 0
+        drawBarIndex   := -1
+else
+    drawDirection := 0
+    drawBarIndex   := -1
+
+dayOk = switch dayFilter
+    "thu_fri" => dayofweek == dayofweek.thursday or dayofweek == dayofweek.friday
+    "mon_fri" => dayofweek != dayofweek.saturday and dayofweek != dayofweek.sunday
+    => true
+
+// ─── Suppressed Signals ───────────────────────────────────────────────────
+kzSuppressed   = enableKZ and not inKillZone and (ltfTSDir != 0 or ltfM1Confirmed or ltfBreaker or ltfKOD or triggerNow)
+dlpSuppressed  = enableDLP and drawDirection != 0 and (
+    (ltfM1Confirmed and ltfM1Dir != 0 and ltfM1Dir != drawDirection) or
+    (ltfBreaker and ltfBreakerDir != 0 and ltfBreakerDir != drawDirection)
+)
+daySuppressed  = dayFilter != "any" and not dayOk and (ltfTSDir != 0 or ltfM1Confirmed or ltfBreaker or ltfKOD)
+
+// ══════════════════════════════════════════════════════════════════════════
+//  PART 5: VISUALS
+// ══════════════════════════════════════════════════════════════════════════
+
+// ─── 4H Range Boxes ──────────────────────────────────────────────────────
+// At isNew4H, index 2 is C1. Its 4H interval = [now-12h, now-8h].
+// Draw a transparent box showing C1's range.
+if show4HBoxes and isNew4H and has4HData
+    c1HBox = array.get(h4Highs, 2)
+    c1LBox = array.get(h4Lows,  2)
+    t4 = time - (time % (4 * 3600 * 1000))  // current 4H candle open
+    box.new(t4 - 12 * 3600 * 1000, c1HBox, t4 - 8 * 3600 * 1000, c1LBox,
+        xloc=xloc.bar_time, bgcolor=color.new(color.blue, 92), border_color=color.new(color.blue, 60), border_width=1, text="C1")
+
+// ─── 4H Pattern Markers (at new candle open) ─────────────────────────────
+if isNew4H and showCRT and htfSignalDir != 0
+    lbStyle  = htfSignalDir == 1 ? shape.arrowup : shape.arrowdown
+    lbColor  = htfPhase == "CRT" ? color.blue : htfPhase == "2C" ? color.fuchsia : color.aqua
+    lbLoc    = htfSignalDir == 1 ? location.belowbar : location.abovebar
+    label.new(bar_index, htfSignalDir == 1 ? low : high, htfPhase,
+        color=lbColor, style=lbStyle == shape.arrowup ? label.style_label_up : label.style_label_down,
+        textcolor=color.white, size=size.small)
+
+// ─── 4H Trade Levels Overlay ─────────────────────────────────────────────
+// Draw once when signal starts, then only on trigger confirmation to avoid clutter
+if showTradeLvls and ((isNew4H and activeHTFSignal != 0) or triggerNow) and not na(activeEntry) and not na(activeSL)
+    e_ = activeEntry
+    s_ = activeSL
+    r_ = math.abs(e_ - s_)
+    t1 = activeHTFSignal == 1 ? e_ + r_ * 1.5 : e_ - r_ * 1.5
+    t2 = activeHTFSignal == 1 ? e_ + r_ * 2.0 : e_ - r_ * 2.0
+    lc = activeHTFSignal == 1 ? color.lime : color.red
+    fore = bar_index + 2
+    // Lines
+    line.new(bar_index, e_, fore, e_, color=lc, width=1, style=line.style_dashed, extend=extend.right)
+    line.new(bar_index, s_, fore, s_, color=color.new(color.red, 40), width=1, style=line.style_dashed, extend=extend.right)
+    line.new(bar_index, t1, fore, t1, color=color.new(color.green, 50), width=1, style=line.style_dotted, extend=extend.right)
+    line.new(bar_index, t2, fore, t2, color=color.new(color.lime, 40), width=1, style=line.style_dotted, extend=extend.right)
+    // Price labels
+    label.new(bar_index + 1, e_, "ENTRY\n" + str.tostring(e_, format.mintick), color=lc, style=label.style_label_center, textcolor=color.white, size=size.tiny)
+    label.new(bar_index + 1, s_, "SL\n" + str.tostring(s_, format.mintick), color=color.new(color.red, 60), style=label.style_label_center, textcolor=color.white, size=size.tiny)
+    label.new(bar_index + 1, t1, "TP1\n" + str.tostring(t1, format.mintick), color=color.new(color.green, 60), style=label.style_label_center, textcolor=color.white, size=size.tiny)
+    label.new(bar_index + 1, t2, "TP2\n" + str.tostring(t2, format.mintick), color=color.new(color.lime, 60), style=label.style_label_center, textcolor=color.white, size=size.tiny)
+    label.new(bar_index, high + ltfATR * 0.5, htfPhase + " " + (activeHTFSignal == 1 ? "LONG" : "SHORT"), color=lc, style=label.style_label_down, textcolor=color.white, size=size.small)
+
+// ─── 15M Entry Trigger ───────────────────────────────────────────────────
+if showEntryTrig and triggerNow
+    label.new(bar_index, low - ltfATR * 0.5, "⚡ ENTRY\n" + htfPhase + " " + (activeHTFSignal == 1 ? "LONG" : "SHORT"),
+        color=color.new(color.yellow, 70), style=label.style_label_up, textcolor=color.black, size=size.small)
+
+// ─── 15M Pattern Markers ─────────────────────────────────────────────────
+plotshape(showCRT and not na(ltfSwingHigh), "Swing H", shape.triangledown, location.abovebar, color.orange, size=size.tiny)
+plotshape(showCRT and not na(ltfSwingLow),  "Swing L", shape.triangleup,   location.belowbar, color.orange, size=size.tiny)
+plotshape(showTS and ltfTSLowSweep,  "TS Bull", shape.diamond, location.belowbar, color.green, size=size.small)
+plotshape(showTS and ltfTSHighSweep, "TS Bear", shape.diamond, location.abovebar, color.red,   size=size.small)
+plotshape(showM1 and ltfM1Candle and ltfM1Dir == 1, "M1 Bull", shape.square, location.belowbar, color.lime, size=size.small)
+plotshape(showM1 and ltfM1Candle and ltfM1Dir == -1,"M1 Bear", shape.square, location.abovebar, color.maroon, size=size.small)
+plotshape(showBreaker and ltfBreaker and ltfBreakerDir == 1, "Brk Bull", shape.cross, location.belowbar, color.teal,  size=size.tiny)
+plotshape(showBreaker and ltfBreaker and ltfBreakerDir == -1,"Brk Bear", shape.cross, location.abovebar, color.purple, size=size.tiny)
+plotshape(showKOD and ltfKOD and ltfTSDir == 1, "KOD Bull", shape.xcross, location.belowbar, color.yellow, size=size.small)
+plotshape(showKOD and ltfKOD and ltfTSDir == -1,"KOD Bear", shape.xcross, location.abovebar, color.yellow, size=size.small)
+
+// ─── 15M Trade Levels (Model-1) ──────────────────────────────────────────
+if showM1 and ltfM1Confirmed and showTradeLvls
+    e_ = ltfM1Dir == 1 ? low[1] : high[1]
+    s_ = ltfM1Dir == 1 ? low[1] - ltfATR * 0.5 : high[1] + ltfATR * 0.5
+    r_ = math.abs(e_ - s_)
+    t1 = ltfM1Dir == 1 ? e_ + r_ * 1.5 : e_ - r_ * 1.5
+    t2 = ltfM1Dir == 1 ? e_ + r_ * 2.0 : e_ - r_ * 2.0
+    lc = ltfM1Dir == 1 ? color.lime : color.red
+    fore = bar_index + 2
+    line.new(bar_index - 1, e_, fore, e_, color=lc, width=1, style=line.style_dashed, extend=extend.right)
+    line.new(bar_index - 1, s_, fore, s_, color=color.new(color.red, 40), width=1, style=line.style_dashed, extend=extend.right)
+    line.new(bar_index - 1, t1, fore, t1, color=color.new(color.green, 50), width=1, style=line.style_dotted, extend=extend.right)
+    line.new(bar_index - 1, t2, fore, t2, color=color.new(color.lime, 40), width=1, style=line.style_dotted, extend=extend.right)
+    label.new(bar_index - 1, high + ltfATR * 0.5, ltfM1Dir == 1 ? "M1 LONG" : "M1 SHORT", color=lc, style=label.style_label_down, textcolor=color.white, size=size.small)
+
+// ─── Visual: KZ, DLP, Warnings ───────────────────────────────────────────
+bgcolor(showKZShade and inKillZone ? color.new(color.blue, 95) : na, title="KZ Background")
+bgcolor(enableKZ and not inKillZone ? color.new(color.gray, 97) : na, title="Non-KZ Dimming")
+if kzSuppressed and kzWarn
+    label.new(bar_index, low - ltfATR * 0.5, "⛔ OUTSIDE KZ", color=color.new(color.gray, 80), style=label.style_label_up, textcolor=color.white, size=size.tiny)
+if dlpSuppressed
+    label.new(bar_index, low - ltfATR * 1.0, "⚠ DLP FILTERED", color=color.new(color.orange, 80), style=label.style_label_up, textcolor=color.white, size=size.tiny)
+if daySuppressed
+    label.new(bar_index, low - ltfATR * 1.5, "⛔ DAY FILTERED (" + dayFilter + ")", color=color.new(color.maroon, 80), style=label.style_label_up, textcolor=color.white, size=size.tiny)
+
+// DLP line
+var line dlLine = na
+if enableDLP and drawDirection != 0
+    line.delete(dlLine)
+    dlClr = drawDirection == 1 ? color.green : color.red
+    dlLine := line.new(bar_index - 1, high + ltfATR * 1.5, bar_index, high + ltfATR * 1.5,
+       color=color.new(dlClr, 50), width=2, style=line.style_dashed, extend=extend.right)
+    label.new(bar_index, high + ltfATR * 2, drawDirection == 1 ? "DRAW BULLISH" : "DRAW BEARISH",
+       color=color.new(dlClr, 70), style=label.style_label_down, textcolor=color.white, size=size.tiny)
+else
+    line.delete(dlLine)
+
+// OTE Box
 var box oteBox = na
-if showOTE and not na(oteLow) and not na(oteHigh)
+if showOTE and not na(ltfOTELow) and not na(ltfOTEHigh)
     box.delete(oteBox)
-    oteBox := box.new(bar_index - lookback, oteHigh, bar_index, oteLow,
-      bgcolor=color.new(color.aqua, 90),
-      border_color=color.new(color.aqua, 70),
-      border_width=1, text="OTE")
+    oteBox := box.new(bar_index - lookback, ltfOTEHigh, bar_index, ltfOTELow,
+       bgcolor=color.new(color.aqua, 90), border_color=color.new(color.aqua, 70), border_width=1, text="OTE")
 
-// ─── Trade Level Drawing (inlined — no function to avoid v6 restrictions) ───
-slHalf = atrVal * 0.5
+// ══════════════════════════════════════════════════════════════════════════
+//  PART 6: TABLE & ALERTS
+// ══════════════════════════════════════════════════════════════════════════
 
-// Model-1 confirmed
-if showM1 and m1Confirmed and showTradeLvls
-    e_ = m1Direction == 1 ? low[1] : high[1]
-    s_ = m1Direction == 1 ? low[1] - slHalf : high[1] + slHalf
-    r_ = math.abs(e_ - s_)
-    t1 = m1Direction == 1 ? e_ + r_ * 1.5 : e_ - r_ * 1.5
-    t2 = m1Direction == 1 ? e_ + r_ * 2.0 : e_ - r_ * 2.0
-    lc = m1Direction == 1 ? color.lime : color.red
-    line.new(bar_index - 1, e_, bar_index + 2, e_, color=lc, width=1, style=line.style_dashed, extend=extend.right)
-    line.new(bar_index - 1, s_, bar_index + 2, s_, color=color.new(color.red, 30), width=1, style=line.style_dashed, extend=extend.right)
-    line.new(bar_index - 1, t1, bar_index + 2, t1, color=color.new(color.green, 40), width=1, style=line.style_dotted, extend=extend.right)
-    line.new(bar_index - 1, t2, bar_index + 2, t2, color=color.new(color.lime, 30), width=1, style=line.style_dotted, extend=extend.right)
-    label.new(bar_index - 1, high + atrVal * 0.5, m1Direction == 1 ? "M1 LONG" : "M1 SHORT", color=lc, style=label.style_label_down, textcolor=color.white, size=size.small)
-
-// CRT pattern
-if showCRT and crtPattern and showTradeLvls
-    e_ = crtDir == 1 ? low[2] : high[2]
-    s_ = crtDir == 1 ? low[2] - slHalf : high[2] + slHalf
-    r_ = math.abs(e_ - s_)
-    t1 = crtDir == 1 ? e_ + r_ * 1.5 : e_ - r_ * 1.5
-    t2 = crtDir == 1 ? e_ + r_ * 2.0 : e_ - r_ * 2.0
-    lc = crtDir == 1 ? color.blue : color.orange
-    line.new(bar_index, e_, bar_index + 2, e_, color=lc, width=1, style=line.style_dashed, extend=extend.right)
-    line.new(bar_index, s_, bar_index + 2, s_, color=color.new(color.red, 30), width=1, style=line.style_dashed, extend=extend.right)
-    line.new(bar_index, t1, bar_index + 2, t1, color=color.new(color.green, 40), width=1, style=line.style_dotted, extend=extend.right)
-    line.new(bar_index, t2, bar_index + 2, t2, color=color.new(color.lime, 30), width=1, style=line.style_dotted, extend=extend.right)
-    label.new(bar_index, high + atrVal * 0.5, crtDir == 1 ? "CRT LONG" : "CRT SHORT", color=lc, style=label.style_label_down, textcolor=color.white, size=size.small)
-
-// Breaker
-if showBreaker and breakerCandle and showTradeLvls
-    e_ = breakerDir == 1 ? bodyLow[1] : bodyHigh[1]
-    s_ = breakerDir == 1 ? low[1] - slHalf : high[1] + slHalf
-    r_ = math.abs(e_ - s_)
-    t1 = breakerDir == 1 ? e_ + r_ * 1.5 : e_ - r_ * 1.5
-    t2 = breakerDir == 1 ? e_ + r_ * 2.0 : e_ - r_ * 2.0
-    lc = breakerDir == 1 ? color.teal : color.purple
-    line.new(bar_index - 1, e_, bar_index + 2, e_, color=lc, width=1, style=line.style_dashed, extend=extend.right)
-    line.new(bar_index - 1, s_, bar_index + 2, s_, color=color.new(color.red, 30), width=1, style=line.style_dashed, extend=extend.right)
-    line.new(bar_index - 1, t1, bar_index + 2, t1, color=color.new(color.green, 40), width=1, style=line.style_dotted, extend=extend.right)
-    line.new(bar_index - 1, t2, bar_index + 2, t2, color=color.new(color.lime, 30), width=1, style=line.style_dotted, extend=extend.right)
-    label.new(bar_index - 1, high + atrVal * 0.5, breakerDir == 1 ? "BRK LONG" : "BRK SHORT", color=lc, style=label.style_label_down, textcolor=color.white, size=size.small)
-
-// ─── Table Info ─────────────────────────────────────────────────────────────
-var table infoTbl = table.new(position.bottom_right, 2, 1, bgcolor=color.new(color.black, 80), frame_color=color.gray)
+var table infoTbl = table.new(position.bottom_right, 2, 5, bgcolor=color.new(color.black, 80), frame_color=color.gray)
 if barstate.islast
-    table.cell(infoTbl, 0, 0, "CRT Det v1 | Swing " + str.tostring(swingLen), text_color=color.gray, text_size=size.tiny)
+    table.cell(infoTbl, 0, 0, "CRT MTF v1", text_color=color.gray, text_size=size.tiny)
+    table.cell(infoTbl, 0, 1, htfRes + "→" + str.tostring(timeframe.period), text_color=color.gray, text_size=size.tiny)
+    if enableDLP and drawDirection != 0
+        table.cell(infoTbl, 0, 2, "DLP: " + (drawDirection == 1 ? "BULL" : "BEAR"), text_color=drawDirection == 1 ? color.green : color.red, text_size=size.tiny)
+    if enableKZ
+        table.cell(infoTbl, 0, 3, inKillZone ? "IN KZ" : "OUT KZ", text_color=inKillZone ? color.lime : color.red, text_size=size.tiny)
+    if activeHTFSignal != 0 and not na(activeEntry)
+        table.cell(infoTbl, 0, 4, htfPhase + " @" + str.tostring(activeEntry, format.mintick), text_color=color.blue, text_size=size.tiny)
 
-// ─── Alerts ─────────────────────────────────────────────────────────────────
-if alertOnSignal and (crtPattern or m1Confirmed or breakerCandle or kissOfDeath)
-    msg = ""
-    if crtPattern and crtDir == 1
-        msg := msg + "CRT BULL "
-    if crtPattern and crtDir == -1
-        msg := msg + "CRT BEAR "
-    if m1Confirmed and m1Direction == 1
-        msg := msg + "| M1 BULL "
-    if m1Confirmed and m1Direction == -1
-        msg := msg + "| M1 BEAR "
-    if breakerCandle and breakerDir == 1
-        msg := msg + "| BRK BULL "
-    if breakerCandle and breakerDir == -1
-        msg := msg + "| BRK BEAR "
-    if kissOfDeath and tsDirection == 1
-        msg := msg + "| KOD BULL "
-    if kissOfDeath and tsDirection == -1
-        msg := msg + "| KOD BEAR "
-    alert("CRT Signal: " + msg, alert.freq_once_per_bar)
+// ─── Alerts ──────────────────────────────────────────────────────────────
+shouldAlert = alertOnSignal and (
+    ltfM1Confirmed or ltfBreaker or ltfKOD or triggerNow
+)
+shouldAlert := enableKZ ? (shouldAlert and inKillZone) : shouldAlert
+shouldAlert := dayFilter != "any" ? (shouldAlert and dayOk) : shouldAlert
+shouldAlert := enableDLP ? (shouldAlert and not dlpSuppressed) : shouldAlert
+
+if shouldAlert
+    msg = "CRT"
+    if htfPhase != "" and activeHTFSignal != 0
+        msg := msg + " [" + htfPhase + " " + (activeHTFSignal == 1 ? "BULL" : "BEAR") + "]"
+    if triggerNow
+        msg := msg + " ⚡ENTRY"
+    if ltfM1Confirmed
+        msg := msg + " | M1 " + (ltfM1Dir == 1 ? "BULL" : "BEAR")
+    if ltfBreaker
+        msg := msg + " | BRK " + (ltfBreakerDir == 1 ? "BULL" : "BEAR")
+    if ltfKOD
+        msg := msg + " | KOD " + (ltfTSDir == 1 ? "BULL" : "BEAR")
+    alert("CRT MTF: " + msg, alert.freq_once_per_bar)
 
 plot(na, "Debug", display=display.none)
