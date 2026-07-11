@@ -1,0 +1,127 @@
+//@version=6
+indicator(title="CRT Part 2 — Standard CRT 1-2-3 + 2-Candle + Inside-Bar", shorttitle="CRT P2", overlay=true, format=format.price, precision=2)
+
+// ─── Inputs ──────────────────────────────────────────────────────────────
+htfRes       = input.string("240",  "HTF Resolution",      options=["60","120","240","480","D"], group="Core")
+insideBarLen = input.int(3,         "Min Inside-Bar Candles", minval=2, maxval=20, group="Extra CRT")
+showCRT      = input.bool(true,     "Show Standard CRT",   group="Display")
+show2C       = input.bool(true,     "Show 2-Candle CRT",   group="Display")
+showIB       = input.bool(true,     "Show Inside-Bar CRT", group="Display")
+
+// ══════════════════════════════════════════════════════════════════════════
+//  4H DATA
+// ══════════════════════════════════════════════════════════════════════════
+
+// Fetch 4H OHLC with offsets from current forming bar:
+//   idx-3 = C1 (standard CRT's first candle)
+//   idx-2 = C2 (standard CRT's second candle, 2C's first candle)
+//   idx-1 = C3 (standard CRT's third candle, 2C's second candle)
+[c1H, c1L, c2H, c2L, c2C, c3H, c3L, c3C, c3O] =
+ request.security(syminfo.tickerid, htfRes, [high[3], low[3], high[2], low[2], close[2], high[1], low[1], close[1], open[1]])
+
+// 4H boundary detection (timezone-independent)
+_4hMs   = 4 * 3600 * 1000
+isNew4H = time % _4hMs < time[1] % _4hMs
+
+// ══════════════════════════════════════════════════════════════════════════
+//  PATTERN DETECTION
+// ══════════════════════════════════════════════════════════════════════════
+
+// Each pattern is evaluated when isNew4H fires. The 4H candle offsets are:
+//   C1 = index-3 (standard CRT's first candle)   high[3], low[3]
+//   C2 = index-2 (standard CRT's second candle)  high[2], low[2], close[2]
+//   C3 = index-1 (standard CRT's third candle - the just-completed one)
+
+// ─── Standard 1-2-3 CRT ──────────────────────────────────────────────────
+// Rule: C2 sweeps C1's extreme, C3 closes beyond C2's extreme.
+//       C1 = 3 bars back (index-3), C2 = 2 bars back (index-2), C3 = 1 bar back (index-1)
+
+crtDefined = not na(c1H) and not na(c1L) and not na(c2H) and not na(c2L) and not na(c3C)
+
+// C2 sweeps C1: C2 high > C1 high AND C2 close < C1 high (bearish sweep), OR
+//               C2 low  < C1 low  AND C2 close > C1 low  (bullish sweep)
+c2SweepBear = c2H > c1H and c2C < c1H
+c2SweepBull = c2L < c1L and c2C > c1L
+
+// C3 confirms: breaks C2 extreme AND C1 extreme
+c3ConfBull = c3C > c2H and c2H < c1H and c3C > c1H
+c3ConfBear = c3C < c2L and c2L > c1L and c3C < c1L
+
+crtBull = crtDefined and c2SweepBull and c3ConfBull
+crtBear = crtDefined and c2SweepBear and c3ConfBear
+crtDir  = crtBull ? 1 : crtBear ? -1 : 0
+
+// Entry: at C1's extreme in the direction of the breakout
+//   Bull entry = C1 low,  Stop = C2 low
+//   Bear entry = C1 high, Stop = C2 high
+crtEntry = crtBull ? c1L : crtBear ? c1H : na
+crtStop  = crtBull ? c2L : crtBear ? c2H : na
+
+// ─── 2-Candle CRT ────────────────────────────────────────────────────────
+// Only 2 candles involved: C1 (index-1) and C2 (index-0 from current forming).
+// C2 sweeps C1's extreme and closes beyond C1's opposite extreme.
+// Entry at C2 close.
+
+// C1 = idx-2 (c2H/c2L), C2 = idx-1 (c3H/c3L/c3C, the last completed bar)
+_2cDef = not na(c2H) and not na(c2L) and not na(c3H) and not na(c3L) and not na(c3C)
+
+// C2 sweeps C1's extreme and closes beyond the opposite extreme in one candle
+_2cBull = _2cDef and c3L < c2L and c3C > c2H   // Swept low, closed above high
+_2cBear = _2cDef and c3H > c2H and c3C < c2L   // Swept high, closed below low
+
+_2cDir  = _2cBull ? 1 : _2cBear ? -1 : 0
+
+// Entry at C2 close, Stop at C2's sweep extreme
+_2cEntry = _2cBull ? c3C : _2cBear ? c3C : na
+_2cStop  = _2cBull ? c3L : _2cBear ? c3H : na
+
+// ─── Inside-Bar CRT ───────────────────────────────────────────────────────
+// TODO: Inside-bar detection needs more history (scan range candle + inside candles)
+// Will be added in a later part. Placeholder for now.
+ibDir    = 0
+ibEntry  = na
+ibStop   = na
+
+// ══════════════════════════════════════════════════════════════════════════
+//  SIGNAL STATE
+// ══════════════════════════════════════════════════════════════════════════
+
+var int   sigDir  = 0
+var float sigEntry = na
+var float sigStop  = na
+var string sigPhase = ""
+
+if isNew4H
+    sigDir  := 0
+    sigEntry := na
+    sigStop  := na
+    sigPhase := ""
+
+    if showCRT and crtDir != 0
+        sigDir   := crtDir
+        sigEntry := crtEntry
+        sigStop  := crtStop
+        sigPhase := "CRT"
+    else if show2C and _2cDir != 0
+        sigDir   := _2cDir
+        sigEntry := _2cEntry
+        sigStop  := _2cStop
+        sigPhase := "2C"
+
+// ══════════════════════════════════════════════════════════════════════════
+//  VISUALS
+// ══════════════════════════════════════════════════════════════════════════
+
+// Pattern markers at each 4H boundary
+plotchar(isNew4H and crtDir != 0, "CRT",  "▲", location=location.belowbar, color=color.blue, size=size.small)
+plotchar(isNew4H and _2cDir != 0, "2C",   "◆", location=location.belowbar, color=color.fuchsia, size=size.small)
+
+// Debug table
+var table dbg = table.new(position.bottom_right, 2, 6, bgcolor=color.new(color.black, 85), frame_color=color.gray)
+if barstate.islast
+    table.cell(dbg, 0, 0, "CRT P2", text_color=color.gray, text_size=size.tiny)
+    table.cell(dbg, 0, 1, "C1 " + str.tostring(c1H, format.mintick) + "/" + str.tostring(c1L, format.mintick), text_color=color.blue, text_size=size.tiny)
+    table.cell(dbg, 0, 2, "C2 " + str.tostring(c2H, format.mintick) + "/" + str.tostring(c2L, format.mintick), text_color=color.aqua, text_size=size.tiny)
+    table.cell(dbg, 0, 3, "C3 " + str.tostring(c3O, format.mintick) + "→" + str.tostring(c3C, format.mintick), text_color=color.white, text_size=size.tiny)
+    table.cell(dbg, 0, 4, "CRT: " + (crtDir == 1 ? "BULL" : crtDir == -1 ? "BEAR" : "—"), text_color=color.blue, text_size=size.tiny)
+    table.cell(dbg, 0, 5, "2C:  " + (_2cDir == 1 ? "BULL" : _2cDir == -1 ? "BEAR" : "—"), text_color=color.fuchsia, text_size=size.tiny)

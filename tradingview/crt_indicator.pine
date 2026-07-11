@@ -31,7 +31,11 @@ enableDLP     = input.bool(false, "Enable Draw Liquidity Priority", group="Draw 
 
 // ─── Inputs: Day Filter ───────────────────────────────────────────────────
 dayFilter     = input.string("any", "Day Filter",
-   options=["any", "thu_fri", "mon_fri"], group="Day Filter")
+    options=["any", "thu_fri", "mon_fri", "tue_thu_fri"], group="Day Filter")
+
+// ─── Inputs: Daily Bias ────────────────────────────────────────────────────
+showBias     = input.bool(true,  "Show Daily Bias Label",           group="Daily Bias")
+showBiasWarn = input.bool(true,  "Warn on Bias Mismatch",           group="Daily Bias")
 
 // ─── Inputs: Extra CRT Types ──────────────────────────────────────────────
 show2Candle   = input.bool(true,  "Show 2-Candle CRT",            group="Extra CRT Types")
@@ -39,15 +43,34 @@ showInsideBar = input.bool(true,  "Show Inside-Bar CRT",          group="Extra C
 insideBarLen  = input.int(3,      "Min Inside-Bar Candles", minval=2, maxval=20, group="Extra CRT Types")
 
 // ══════════════════════════════════════════════════════════════════════════
+//  PART 1A: DAILY BIAS (Layer 1 — Directional Context)
+// ══════════════════════════════════════════════════════════════════════════
+
+[dO, dH, dL, dC, dT] = request.security(syminfo.tickerid, "D",
+    [open, high, low, close, time], lookahead = barmerge.lookahead_off)
+
+dC1 = request.security(syminfo.tickerid, "D", close[1], lookahead = barmerge.lookahead_off)
+
+isNewDay = ta.change(dT) != 0
+
+dCloseBias = dC > dC1 ? 1 : dC < dC1 ? -1 : 0
+dBodyHi    = math.max(dO, dC)
+dBodyLo    = math.min(dO, dC)
+dWickUp    = dH - dBodyHi
+dWickDn    = dBodyLo - dL
+dWickBias  = dWickUp > dWickDn * 1.5 ? -1 : dWickDn > dWickUp * 1.5 ? 1 : dCloseBias
+htfBias    = dCloseBias != 0 ? dCloseBias : dWickBias
+
+// ══════════════════════════════════════════════════════════════════════════
 //  PART 1: 4H (HTF) DATA FETCHING AND PATTERN DETECTION
 // ══════════════════════════════════════════════════════════════════════════
 
 // Fetch 4H time for new-candle detection
-htfT = request.security(syminfo.tickerid, htfRes, time)
+htfT = request.security(syminfo.tickerid, htfRes, time, lookahead = barmerge.lookahead_off)
 
 // Fetch previous 4H candle OHLC for array storage
 [htfO1, htfH1, htfL1, htfC1] = request.security(syminfo.tickerid, htfRes,
-    [open[1], high[1], low[1], close[1]])
+    [open[1], high[1], low[1], close[1]], lookahead = barmerge.lookahead_off)
 
 // Detect new 4H candle (time changes)
 isNew4H = ta.change(htfT) != 0
@@ -178,6 +201,10 @@ if isNew4H
         htfPhase      := "IB"
         htfSignalBar  := bar_index
 
+// HTF Bias alignment check
+// RULES.md Failure Mode 3: "Ignore ALL bullish patterns going to a bearish target."
+crtAligned = htfSignalDir == htfBias or htfBias == 0
+
 // ══════════════════════════════════════════════════════════════════════════
 //  PART 2: 15M (LTF) PATTERN DETECTION
 // ══════════════════════════════════════════════════════════════════════════
@@ -240,16 +267,64 @@ ltfBreaker = ltfM1Candle[1] and (
 )
 ltfBreakerDir = ltfM1Dir[1]
 
-// ══════════════════════════════════════════════════════════════════════════
-//  PART 3: 15M ENTRY TRIGGER (4H pattern + 15M confirmation)
-// ══════════════════════════════════════════════════════════════════════════
-
-// A 4H signal is "active" for its 4-hour duration (16 x 15M bars)
+// ─── Active signal state (declared here for TSQ state machine) ──────────
 var int   activeHTFSignal = 0
 var float activeEntry     = na
 var float activeSL        = na
 var int   activeSignalBar = -1
 var int   activeStartBar  = -1
+var bool  triggerFired    = false
+
+// ══════════════════════════════════════════════════════════════════════════
+//  PART 3A: TSQ STATE MACHINE (Phase-gated pattern sequencing)
+// ══════════════════════════════════════════════════════════════════════════
+
+// TSQ phases: 0=Waiting, 1=TS, 2=M1, 3=Breaker, 4=OTE, 5=KOD
+var int tsqPhase = 0
+var int tsqDir   = 0
+
+if isNew4H and htfSignalDir != 0
+    tsqPhase := 0
+    tsqDir := 0
+
+// Phase 0→1: Turtle Soup sweep detected (must match HTF signal direction)
+tsqTargetDir = activeHTFSignal != 0 ? activeHTFSignal : htfSignalDir
+if tsqPhase == 0 and (ltfTSLowSweep or ltfTSHighSweep) and ltfTSDir == tsqTargetDir
+    tsqPhase := 1
+    tsqDir := ltfTSDir
+
+// Phase 1→2: M1 confirms in the TS direction
+if tsqPhase == 1 and ltfM1Confirmed and ltfM1Dir == tsqDir
+    tsqPhase := 2
+
+// Phase 2→3: Breaker retest of TS extreme
+if tsqPhase == 2 and ltfBreaker and ltfBreakerDir == tsqDir
+    tsqPhase := 3
+
+// Phase 3→4: Price enters the OTE Fibonacci zone (0.618–0.79)
+if tsqPhase == 3 and not na(ltfOTELow) and (
+    (tsqDir ==  1 and close >= ltfOTELow  and close <= ltfOTEHigh) or
+    (tsqDir == -1 and close <= ltfOTEHigh and close >= ltfOTELow)
+)
+    tsqPhase := 4
+
+// Phase 4→5: KOD — final sweep in the TS direction
+if tsqPhase == 4 and ltfKOD and ltfTSDir == tsqDir
+    tsqPhase := 5
+
+// Phase timeout: reset after 4 hours (16×15M) of inactivity
+if tsqPhase > 0 and bar_index - activeStartBar > 16
+    tsqPhase := 0
+    tsqDir := 0
+
+// Gated pattern flags — only fire when in the correct phase
+ltfM1Gated     = ltfM1Confirmed and tsqPhase >= 2 and ltfM1Dir == tsqDir
+ltfBreakerGated = ltfBreaker     and tsqPhase >= 3 and ltfBreakerDir == tsqDir
+ltfKODGated    = ltfKOD          and tsqPhase >= 4 and ltfTSDir == tsqDir
+
+// ══════════════════════════════════════════════════════════════════════════
+//  PART 3: 15M ENTRY TRIGGER (4H pattern + 15M confirmation)
+// ══════════════════════════════════════════════════════════════════════════
 
 if isNew4H
     if htfSignalDir != 0
@@ -270,13 +345,11 @@ if not isNew4H and activeStartBar > 0 and bar_index - activeStartBar > 16
 // 15M triggers: Model-1 at entry, or LTF close crossing entry level
 // Only trigger if signal is still fresh (< 16 bars old)
 triggerFresh = activeStartBar > 0 and bar_index - activeStartBar < 16
-triggerM1    = activeHTFSignal != 0 and triggerFresh and ltfM1Confirmed and ltfM1Dir == activeHTFSignal
+triggerM1    = activeHTFSignal != 0 and triggerFresh and ltfM1Gated and ltfM1Dir == activeHTFSignal
 triggerPrice = activeHTFSignal != 0 and triggerFresh and not na(activeEntry) and (
     (activeHTFSignal == 1 and close > activeEntry) or
     (activeHTFSignal == -1 and close < activeEntry)
 )
-// Only trigger once per 4H signal
-var bool triggerFired = false
 if isNew4H
     triggerFired := false
 triggerNow = (triggerM1 or triggerPrice) and not triggerFired
@@ -287,8 +360,9 @@ if triggerNow
 //  PART 4: KILL ZONES, DLP, DAY FILTER
 // ══════════════════════════════════════════════════════════════════════════
 
-kzLondon   = hour >= 2 and hour < 5
-kzNewYork  = hour >= 7 and hour < 10
+nyHour     = hour(time, "America/New_York")
+kzLondon   = nyHour >= 2 and nyHour < 5
+kzNewYork  = nyHour >= 7 and nyHour < 10
 inKillZone = kzLondon or kzNewYork
 
 var int drawDirection  = 0
@@ -306,8 +380,9 @@ else
     drawBarIndex   := -1
 
 dayOk = switch dayFilter
-    "thu_fri" => dayofweek == dayofweek.thursday or dayofweek == dayofweek.friday
-    "mon_fri" => dayofweek != dayofweek.saturday and dayofweek != dayofweek.sunday
+    "thu_fri"    => dayofweek == dayofweek.thursday or dayofweek == dayofweek.friday
+    "mon_fri"    => dayofweek != dayofweek.saturday and dayofweek != dayofweek.sunday
+    "tue_thu_fri" => dayofweek == dayofweek.tuesday or dayofweek == dayofweek.thursday or dayofweek == dayofweek.friday
     => true
 
 // ─── Suppressed Signals ───────────────────────────────────────────────────
@@ -322,28 +397,51 @@ daySuppressed  = dayFilter != "any" and not dayOk and (ltfTSDir != 0 or ltfM1Con
 //  PART 5: VISUALS
 // ══════════════════════════════════════════════════════════════════════════
 
+// ─── Managed Drawing Arrays ──────────────────────────────────────────────
+// Prevent Pine's 500-object limit per type
+var array<line>  managedLines  = array.new<line>()
+var array<label> managedLabels = array.new<label>()
+var array<box>   managedBoxes  = array.new<box>()
+
+f_cleanLines(maxN) =>
+    while array.size(managedLines) > maxN
+        line.delete(array.shift(managedLines))
+
+f_cleanLabels(maxN) =>
+    while array.size(managedLabels) > maxN
+        label.delete(array.shift(managedLabels))
+
+f_cleanBoxes(maxN) =>
+    while array.size(managedBoxes) > maxN
+        box.delete(array.shift(managedBoxes))
+
 // ─── 4H Range Boxes ──────────────────────────────────────────────────────
-// At isNew4H, index 2 is C1. Its 4H interval = [now-12h, now-8h].
-// Draw a transparent box showing C1's range.
 if show4HBoxes and isNew4H and has4HData
+    f_cleanBoxes(30)
     c1HBox = array.get(h4Highs, 2)
     c1LBox = array.get(h4Lows,  2)
-    t4 = time - (time % (4 * 3600 * 1000))  // current 4H candle open
-    box.new(t4 - 12 * 3600 * 1000, c1HBox, t4 - 8 * 3600 * 1000, c1LBox,
-        xloc=xloc.bar_time, bgcolor=color.new(color.blue, 92), border_color=color.new(color.blue, 60), border_width=1, text="C1")
+    t4 = time - (time % (4 * 3600 * 1000))
+    array.push(managedBoxes,
+        box.new(t4 - 12 * 3600 * 1000, c1HBox, t4 - 8 * 3600 * 1000, c1LBox,
+            xloc=xloc.bar_time, bgcolor=color.new(color.blue, 92), border_color=color.new(color.blue, 60), border_width=1, text="C1"))
 
-// ─── 4H Pattern Markers (at new candle open) ─────────────────────────────
+// ─── 4H Pattern Markers ──────────────────────────────────────────────────
 if isNew4H and showCRT and htfSignalDir != 0
+    f_cleanLabels(45)
     lbStyle  = htfSignalDir == 1 ? shape.arrowup : shape.arrowdown
     lbColor  = htfPhase == "CRT" ? color.blue : htfPhase == "2C" ? color.fuchsia : color.aqua
-    lbLoc    = htfSignalDir == 1 ? location.belowbar : location.abovebar
-    label.new(bar_index, htfSignalDir == 1 ? low : high, htfPhase,
-        color=lbColor, style=lbStyle == shape.arrowup ? label.style_label_up : label.style_label_down,
-        textcolor=color.white, size=size.small)
+    lbTxt    = htfPhase
+    if showBias and not crtAligned
+        lbTxt := lbTxt + " !BIAS"
+    array.push(managedLabels,
+        label.new(bar_index, htfSignalDir == 1 ? low : high, lbTxt,
+            color=lbColor, style=lbStyle == shape.arrowup ? label.style_label_up : label.style_label_down,
+            textcolor=color.white, size=size.small))
 
 // ─── 4H Trade Levels Overlay ─────────────────────────────────────────────
-// Draw once when signal starts, then only on trigger confirmation to avoid clutter
 if showTradeLvls and ((isNew4H and activeHTFSignal != 0) or triggerNow) and not na(activeEntry) and not na(activeSL)
+    f_cleanLines(40)
+    f_cleanLabels(60)
     e_ = activeEntry
     s_ = activeSL
     r_ = math.abs(e_ - s_)
@@ -351,37 +449,39 @@ if showTradeLvls and ((isNew4H and activeHTFSignal != 0) or triggerNow) and not 
     t2 = activeHTFSignal == 1 ? e_ + r_ * 2.0 : e_ - r_ * 2.0
     lc = activeHTFSignal == 1 ? color.lime : color.red
     fore = bar_index + 2
-    // Lines
-    line.new(bar_index, e_, fore, e_, color=lc, width=1, style=line.style_dashed, extend=extend.right)
-    line.new(bar_index, s_, fore, s_, color=color.new(color.red, 40), width=1, style=line.style_dashed, extend=extend.right)
-    line.new(bar_index, t1, fore, t1, color=color.new(color.green, 50), width=1, style=line.style_dotted, extend=extend.right)
-    line.new(bar_index, t2, fore, t2, color=color.new(color.lime, 40), width=1, style=line.style_dotted, extend=extend.right)
-    // Price labels
-    label.new(bar_index + 1, e_, "ENTRY\n" + str.tostring(e_, format.mintick), color=lc, style=label.style_label_center, textcolor=color.white, size=size.tiny)
-    label.new(bar_index + 1, s_, "SL\n" + str.tostring(s_, format.mintick), color=color.new(color.red, 60), style=label.style_label_center, textcolor=color.white, size=size.tiny)
-    label.new(bar_index + 1, t1, "TP1\n" + str.tostring(t1, format.mintick), color=color.new(color.green, 60), style=label.style_label_center, textcolor=color.white, size=size.tiny)
-    label.new(bar_index + 1, t2, "TP2\n" + str.tostring(t2, format.mintick), color=color.new(color.lime, 60), style=label.style_label_center, textcolor=color.white, size=size.tiny)
-    label.new(bar_index, high + ltfATR * 0.5, htfPhase + " " + (activeHTFSignal == 1 ? "LONG" : "SHORT"), color=lc, style=label.style_label_down, textcolor=color.white, size=size.small)
+    array.push(managedLines, line.new(bar_index, e_, fore, e_, color=lc, width=1, style=line.style_dashed, extend=extend.right))
+    array.push(managedLines, line.new(bar_index, s_, fore, s_, color=color.new(color.red, 40), width=1, style=line.style_dashed, extend=extend.right))
+    array.push(managedLines, line.new(bar_index, t1, fore, t1, color=color.new(color.green, 50), width=1, style=line.style_dotted, extend=extend.right))
+    array.push(managedLines, line.new(bar_index, t2, fore, t2, color=color.new(color.lime, 40), width=1, style=line.style_dotted, extend=extend.right))
+    array.push(managedLabels, label.new(bar_index + 1, e_, "ENTRY\n" + str.tostring(e_, format.mintick), color=lc, style=label.style_label_center, textcolor=color.white, size=size.tiny))
+    array.push(managedLabels, label.new(bar_index + 1, s_, "SL\n" + str.tostring(s_, format.mintick), color=color.new(color.red, 60), style=label.style_label_center, textcolor=color.white, size=size.tiny))
+    array.push(managedLabels, label.new(bar_index + 1, t1, "TP1\n" + str.tostring(t1, format.mintick), color=color.new(color.green, 60), style=label.style_label_center, textcolor=color.white, size=size.tiny))
+    array.push(managedLabels, label.new(bar_index + 1, t2, "TP2\n" + str.tostring(t2, format.mintick), color=color.new(color.lime, 60), style=label.style_label_center, textcolor=color.white, size=size.tiny))
+    array.push(managedLabels, label.new(bar_index, high + ltfATR * 0.5, htfPhase + " " + (activeHTFSignal == 1 ? "LONG" : "SHORT"), color=lc, style=label.style_label_down, textcolor=color.white, size=size.small))
 
 // ─── 15M Entry Trigger ───────────────────────────────────────────────────
 if showEntryTrig and triggerNow
-    label.new(bar_index, low - ltfATR * 0.5, "⚡ ENTRY\n" + htfPhase + " " + (activeHTFSignal == 1 ? "LONG" : "SHORT"),
-        color=color.new(color.yellow, 70), style=label.style_label_up, textcolor=color.black, size=size.small)
+    f_cleanLabels(50)
+    array.push(managedLabels,
+        label.new(bar_index, low - ltfATR * 0.5, "⚡ ENTRY\n" + htfPhase + " " + (activeHTFSignal == 1 ? "LONG" : "SHORT"),
+            color=color.new(color.yellow, 70), style=label.style_label_up, textcolor=color.black, size=size.small))
 
-// ─── 15M Pattern Markers ─────────────────────────────────────────────────
+// ─── 15M Pattern Markers (plotshape — no cleanup needed) ─────────────────
 plotshape(showCRT and not na(ltfSwingHigh), "Swing H", shape.triangledown, location.abovebar, color.orange, size=size.tiny)
 plotshape(showCRT and not na(ltfSwingLow),  "Swing L", shape.triangleup,   location.belowbar, color.orange, size=size.tiny)
 plotshape(showTS and ltfTSLowSweep,  "TS Bull", shape.diamond, location.belowbar, color.green, size=size.small)
 plotshape(showTS and ltfTSHighSweep, "TS Bear", shape.diamond, location.abovebar, color.red,   size=size.small)
 plotshape(showM1 and ltfM1Candle and ltfM1Dir == 1, "M1 Bull", shape.square, location.belowbar, color.lime, size=size.small)
 plotshape(showM1 and ltfM1Candle and ltfM1Dir == -1,"M1 Bear", shape.square, location.abovebar, color.maroon, size=size.small)
-plotshape(showBreaker and ltfBreaker and ltfBreakerDir == 1, "Brk Bull", shape.cross, location.belowbar, color.teal,  size=size.tiny)
-plotshape(showBreaker and ltfBreaker and ltfBreakerDir == -1,"Brk Bear", shape.cross, location.abovebar, color.purple, size=size.tiny)
-plotshape(showKOD and ltfKOD and ltfTSDir == 1, "KOD Bull", shape.xcross, location.belowbar, color.yellow, size=size.small)
-plotshape(showKOD and ltfKOD and ltfTSDir == -1,"KOD Bear", shape.xcross, location.abovebar, color.yellow, size=size.small)
+plotshape(showBreaker and ltfBreakerGated and ltfBreakerDir == 1, "Brk Bull", shape.cross, location.belowbar, color.teal,  size=size.tiny)
+plotshape(showBreaker and ltfBreakerGated and ltfBreakerDir == -1,"Brk Bear", shape.cross, location.abovebar, color.purple, size=size.tiny)
+plotshape(showKOD and ltfKODGated and ltfTSDir == 1, "KOD Bull", shape.xcross, location.belowbar, color.yellow, size=size.small)
+plotshape(showKOD and ltfKODGated and ltfTSDir == -1,"KOD Bear", shape.xcross, location.abovebar, color.yellow, size=size.small)
 
-// ─── 15M Trade Levels (Model-1) ──────────────────────────────────────────
-if showM1 and ltfM1Confirmed and showTradeLvls
+// ─── 15M Trade Levels (Model-1) — managed via arrays ────────────────────
+if showM1 and ltfM1Gated and showTradeLvls
+    f_cleanLines(40)
+    f_cleanLabels(60)
     e_ = ltfM1Dir == 1 ? low[1] : high[1]
     s_ = ltfM1Dir == 1 ? low[1] - ltfATR * 0.5 : high[1] + ltfATR * 0.5
     r_ = math.abs(e_ - s_)
@@ -389,59 +489,76 @@ if showM1 and ltfM1Confirmed and showTradeLvls
     t2 = ltfM1Dir == 1 ? e_ + r_ * 2.0 : e_ - r_ * 2.0
     lc = ltfM1Dir == 1 ? color.lime : color.red
     fore = bar_index + 2
-    line.new(bar_index - 1, e_, fore, e_, color=lc, width=1, style=line.style_dashed, extend=extend.right)
-    line.new(bar_index - 1, s_, fore, s_, color=color.new(color.red, 40), width=1, style=line.style_dashed, extend=extend.right)
-    line.new(bar_index - 1, t1, fore, t1, color=color.new(color.green, 50), width=1, style=line.style_dotted, extend=extend.right)
-    line.new(bar_index - 1, t2, fore, t2, color=color.new(color.lime, 40), width=1, style=line.style_dotted, extend=extend.right)
-    label.new(bar_index - 1, high + ltfATR * 0.5, ltfM1Dir == 1 ? "M1 LONG" : "M1 SHORT", color=lc, style=label.style_label_down, textcolor=color.white, size=size.small)
+    array.push(managedLines, line.new(bar_index - 1, e_, fore, e_, color=lc, width=1, style=line.style_dashed, extend=extend.right))
+    array.push(managedLines, line.new(bar_index - 1, s_, fore, s_, color=color.new(color.red, 40), width=1, style=line.style_dashed, extend=extend.right))
+    array.push(managedLines, line.new(bar_index - 1, t1, fore, t1, color=color.new(color.green, 50), width=1, style=line.style_dotted, extend=extend.right))
+    array.push(managedLines, line.new(bar_index - 1, t2, fore, t2, color=color.new(color.lime, 40), width=1, style=line.style_dotted, extend=extend.right))
+    array.push(managedLabels, label.new(bar_index - 1, high + ltfATR * 0.5, ltfM1Dir == 1 ? "M1 LONG" : "M1 SHORT", color=lc, style=label.style_label_down, textcolor=color.white, size=size.small))
 
-// ─── Visual: KZ, DLP, Warnings ───────────────────────────────────────────
+// ─── Daily Bias Label ─────────────────────────────────────────────────────
+if isNewDay and showBias and htfBias != 0
+    f_cleanLabels(45)
+    biClr  = htfBias == 1 ? color.green : color.red
+    biTxt  = "BIAS " + (htfBias == 1 ? "BULLISH ▲" : "BEARISH ▼")
+    array.push(managedLabels,
+        label.new(bar_index, low - ltfATR * 2.0, biTxt,
+            color=color.new(biClr, 75), style=label.style_label_up, textcolor=color.white, size=size.tiny))
+
+// ─── Visual: KZ, DLP, Warnings — managed via arrays ────────────────────
 bgcolor(showKZShade and inKillZone ? color.new(color.blue, 95) : na, title="KZ Background")
 bgcolor(enableKZ and not inKillZone ? color.new(color.gray, 97) : na, title="Non-KZ Dimming")
+if showBiasWarn and ltfM1Gated and not crtAligned and not na(htfSignalDir) and htfSignalDir != 0
+    f_cleanLabels(50)
+    array.push(managedLabels, label.new(bar_index, high + ltfATR * 0.3, "⚠ BIAS MISMATCH",
+        color=color.new(color.navy, 80), style=label.style_label_down, textcolor=color.white, size=size.tiny))
+
 if kzSuppressed and kzWarn
-    label.new(bar_index, low - ltfATR * 0.5, "⛔ OUTSIDE KZ", color=color.new(color.gray, 80), style=label.style_label_up, textcolor=color.white, size=size.tiny)
+    f_cleanLabels(50)
+    array.push(managedLabels, label.new(bar_index, low - ltfATR * 0.5, "⛔ OUTSIDE KZ", color=color.new(color.gray, 80), style=label.style_label_up, textcolor=color.white, size=size.tiny))
 if dlpSuppressed
-    label.new(bar_index, low - ltfATR * 1.0, "⚠ DLP FILTERED", color=color.new(color.orange, 80), style=label.style_label_up, textcolor=color.white, size=size.tiny)
+    f_cleanLabels(50)
+    array.push(managedLabels, label.new(bar_index, low - ltfATR * 1.0, "⚠ DLP FILTERED", color=color.new(color.orange, 80), style=label.style_label_up, textcolor=color.white, size=size.tiny))
 if daySuppressed
-    label.new(bar_index, low - ltfATR * 1.5, "⛔ DAY FILTERED (" + dayFilter + ")", color=color.new(color.maroon, 80), style=label.style_label_up, textcolor=color.white, size=size.tiny)
+    f_cleanLabels(50)
+    array.push(managedLabels, label.new(bar_index, low - ltfATR * 1.5, "⛔ DAY FILTERED (" + dayFilter + ")", color=color.new(color.maroon, 80), style=label.style_label_up, textcolor=color.white, size=size.tiny))
 
-// DLP line
-var line dlLine = na
+// DLP line + label — managed via arrays
 if enableDLP and drawDirection != 0
-    line.delete(dlLine)
+    f_cleanLines(30)
+    f_cleanLabels(45)
     dlClr = drawDirection == 1 ? color.green : color.red
-    dlLine := line.new(bar_index - 1, high + ltfATR * 1.5, bar_index, high + ltfATR * 1.5,
-       color=color.new(dlClr, 50), width=2, style=line.style_dashed, extend=extend.right)
-    label.new(bar_index, high + ltfATR * 2, drawDirection == 1 ? "DRAW BULLISH" : "DRAW BEARISH",
-       color=color.new(dlClr, 70), style=label.style_label_down, textcolor=color.white, size=size.tiny)
-else
-    line.delete(dlLine)
+    array.push(managedLines, line.new(bar_index - 1, high + ltfATR * 1.5, bar_index, high + ltfATR * 1.5,
+        color=color.new(dlClr, 50), width=2, style=line.style_dashed, extend=extend.right))
+    array.push(managedLabels, label.new(bar_index, high + ltfATR * 2, drawDirection == 1 ? "DRAW BULLISH" : "DRAW BEARISH",
+        color=color.new(dlClr, 70), style=label.style_label_down, textcolor=color.white, size=size.tiny))
 
-// OTE Box
-var box oteBox = na
+// OTE Box — managed via arrays
 if showOTE and not na(ltfOTELow) and not na(ltfOTEHigh)
-    box.delete(oteBox)
-    oteBox := box.new(bar_index - lookback, ltfOTEHigh, bar_index, ltfOTELow,
-       bgcolor=color.new(color.aqua, 90), border_color=color.new(color.aqua, 70), border_width=1, text="OTE")
+    f_cleanBoxes(20)
+    array.push(managedBoxes, box.new(bar_index - lookback, ltfOTEHigh, bar_index, ltfOTELow,
+        bgcolor=color.new(color.aqua, 90), border_color=color.new(color.aqua, 70), border_width=1, text="OTE"))
 
 // ══════════════════════════════════════════════════════════════════════════
 //  PART 6: TABLE & ALERTS
 // ══════════════════════════════════════════════════════════════════════════
 
-var table infoTbl = table.new(position.bottom_right, 2, 5, bgcolor=color.new(color.black, 80), frame_color=color.gray)
+var table infoTbl = table.new(position.bottom_right, 2, 6, bgcolor=color.new(color.black, 80), frame_color=color.gray)
 if barstate.islast
     table.cell(infoTbl, 0, 0, "CRT MTF v1", text_color=color.gray, text_size=size.tiny)
     table.cell(infoTbl, 0, 1, htfRes + "→" + str.tostring(timeframe.period), text_color=color.gray, text_size=size.tiny)
+    biasClr = htfBias == 1 ? color.green : htfBias == -1 ? color.red : color.gray
+    biasLbl = htfBias == 1 ? "BULL" : htfBias == -1 ? "BEAR" : "---"
+    table.cell(infoTbl, 0, 2, "BIAS: " + biasLbl, text_color=biasClr, text_size=size.tiny)
     if enableDLP and drawDirection != 0
-        table.cell(infoTbl, 0, 2, "DLP: " + (drawDirection == 1 ? "BULL" : "BEAR"), text_color=drawDirection == 1 ? color.green : color.red, text_size=size.tiny)
+        table.cell(infoTbl, 0, 3, "DLP: " + (drawDirection == 1 ? "BULL" : "BEAR"), text_color=drawDirection == 1 ? color.green : color.red, text_size=size.tiny)
     if enableKZ
-        table.cell(infoTbl, 0, 3, inKillZone ? "IN KZ" : "OUT KZ", text_color=inKillZone ? color.lime : color.red, text_size=size.tiny)
+        table.cell(infoTbl, 0, 4, inKillZone ? "IN KZ" : "OUT KZ", text_color=inKillZone ? color.lime : color.red, text_size=size.tiny)
     if activeHTFSignal != 0 and not na(activeEntry)
-        table.cell(infoTbl, 0, 4, htfPhase + " @" + str.tostring(activeEntry, format.mintick), text_color=color.blue, text_size=size.tiny)
+        table.cell(infoTbl, 0, 5, htfPhase + " @" + str.tostring(activeEntry, format.mintick), text_color=color.blue, text_size=size.tiny)
 
 // ─── Alerts ──────────────────────────────────────────────────────────────
 shouldAlert = alertOnSignal and (
-    ltfM1Confirmed or ltfBreaker or ltfKOD or triggerNow
+    ltfM1Gated or ltfBreakerGated or ltfKODGated or triggerNow
 )
 shouldAlert := enableKZ ? (shouldAlert and inKillZone) : shouldAlert
 shouldAlert := dayFilter != "any" ? (shouldAlert and dayOk) : shouldAlert
@@ -453,11 +570,11 @@ if shouldAlert
         msg := msg + " [" + htfPhase + " " + (activeHTFSignal == 1 ? "BULL" : "BEAR") + "]"
     if triggerNow
         msg := msg + " ⚡ENTRY"
-    if ltfM1Confirmed
+    if ltfM1Gated
         msg := msg + " | M1 " + (ltfM1Dir == 1 ? "BULL" : "BEAR")
-    if ltfBreaker
+    if ltfBreakerGated
         msg := msg + " | BRK " + (ltfBreakerDir == 1 ? "BULL" : "BEAR")
-    if ltfKOD
+    if ltfKODGated
         msg := msg + " | KOD " + (ltfTSDir == 1 ? "BULL" : "BEAR")
     alert("CRT MTF: " + msg, alert.freq_once_per_bar)
 

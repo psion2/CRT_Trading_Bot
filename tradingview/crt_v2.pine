@@ -1,0 +1,860 @@
+//@version=6
+// ============================================================================
+// CRT Indicator v2  —  Built phase-by-phase from RULES.md
+// ----------------------------------------------------------------------------
+// PHASE 1  —  CRT RANGE DETECTION (3-candle CRT, Candle 1 = the range)
+//
+//   Concept (RULES.md "Core Concepts" / "CRT Types"):
+//     - Every HTF candle is a time-based RANGE.
+//     - CRT High = buyside liquidity   (the level breakout-buyers chase)
+//     - CRT Low  = sellside liquidity  (the level breakdown-sellers chase)
+//     - 50% level = the minimum guaranteed target once a side is swept.
+//
+//   What Phase 1 does:
+//     - Multi-timeframe: pick a CRT timeframe (default 4H) and view the
+//       indicator on any LOWER timeframe. Each completed HTF candle becomes
+//       "Candle 1" and its high/low are drawn as the CRT range.
+//     - The most-recent range is projected forward over the next N HTF candles
+//       (the expected Candle-2 manipulation + Candle-3 distribution window).
+//     - Older ranges are frozen to their own candle so the chart stays clean.
+//
+//   Correctness / no false hope:
+//     - NON-REPAINTING: uses the last CLOSED HTF candle only
+//       (high[1] + barmerge.lookahead_off). Values never revise after the fact.
+//     - Nothing here is a trade signal yet. Phase 1 only marks ranges so we
+//       can visually confirm the foundation is exact before adding sweeps.
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// PHASE 2  —  TURTLE SOUP (Candle 2 = manipulation / liquidity sweep)
+//
+//   Concept (RULES.md "Turtle Soup", "Pattern Rules"):
+//     - A false break of the CRT range: price sweeps one side (purges the
+//       liquidity resting beyond it) then CLOSES back inside the range.
+//     - Bearish TS: wick ABOVE CRT High (buyside purge) + close back inside
+//                   -> trapped breakout buyers, expect move DOWN.
+//     - Bullish TS: wick BELOW CRT Low (sellside purge) + close back inside
+//                   -> trapped breakdown sellers, expect move UP.
+//     - "Closes tell the truth. Wicks lie." -> the close, not the wick, must
+//       be back inside for a valid turtle soup.
+//
+//   Detection here runs on the CHART (LTF) candles against the HTF range, i.e.
+//   it catches the manipulation of Candle 1's range as it happens on the LTF.
+//   Non-repainting: only fires on a CLOSED chart candle. One sweep per side
+//   per range (memory resets when a new HTF candle opens).
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// PHASE 3  —  MODEL-1 (confirmation entry after a turtle soup)
+//
+//   Concept (RULES.md "Model-1", RomeoTPT CRT Secrets EP1 + MadoCRT EP2):
+//     - Model-1 is the CONFIRMATION that turns a raw sweep into a trade.
+//     - After a turtle soup, a THICK candle must CLOSE decisively back through
+//       the sweep candle in the reversal direction ("closes confirm").
+//         * Bearish: thick DOWN-close candle closes BELOW the purge candle
+//                    -> SHORT.  Entry = purge candle LOW,  SL = purge candle HIGH.
+//         * Bullish: thick UP-close   candle closes ABOVE the purge candle
+//                    -> LONG.   Entry = purge candle HIGH, SL = purge candle LOW.
+//       (RomeoTPT CRT Secrets EP1: "entry above/below the model-1 candle".)
+//     - The setup LIVES ACROSS HTF candles (Candle-2 manipulation may confirm
+//       in Candle-3 — RULES.md: "trade Candle 3"). It ends on confirm / time-out.
+//     - Protected swing = deepest wick of the manipulation, extended up to the
+//       Model-1 candle (captures W-shaped double-bottom reactions).
+//     - Invalidation: a CLOSE beyond the protected swing = structure broke,
+//       setup cancelled (no Model-1). This is what kills false hope.
+//   Model-1 fires both directions here; the Phase-7 HTF-bias gate (further
+//   below) suppresses whichever side is counter to the structural HTF bias.
+// ============================================================================
+
+indicator("CRT v2 — CRT + TS + M1 + Breaker + OTE + KOD + Bias + KZ", overlay = true, max_lines_count = 500, max_boxes_count = 500, max_labels_count = 500)
+
+// ----------------------------------------------------------------------------
+// Inputs
+// ----------------------------------------------------------------------------
+grpTF = "CRT Timeframe"
+htfTF = input.timeframe("240", "CRT (range) timeframe", group = grpTF,
+     tooltip = "Higher timeframe whose candles define the CRT range. View this indicator on a LOWER timeframe. 240 = 4H.")
+
+grpRange = "Range Display"
+showRange  = input.bool(true, "Show CRT range",           group = grpRange)
+show50     = input.bool(true, "Show 50% midline",         group = grpRange)
+showLabels = input.bool(true, "Show labels",              group = grpRange)
+histCount  = input.int(3, "Historical ranges to keep",    minval = 0, maxval = 50, group = grpRange)
+projN      = input.int(3, "Project current range over N HTF candles", minval = 1, maxval = 10, group = grpRange,
+     tooltip = "How far right to project the current range. 3 = Candle 1 (range) + Candle 2 (manipulation) + Candle 3 (distribution).")
+
+grpStyle = "Style"
+highCol = input.color(color.red,           "CRT High color", group = grpStyle)
+lowCol  = input.color(color.green,         "CRT Low color",  group = grpStyle)
+midCol  = input.color(color.gray,          "50% color",      group = grpStyle)
+lineW   = input.int(2, "Range line width", minval = 1, maxval = 5, group = grpStyle)
+
+grpTS = "Turtle Soup (Phase 2)"
+showTS    = input.bool(true,  "Show turtle soup sweeps", group = grpTS)
+tsBullCol = input.color(color.lime, "Bullish TS color", group = grpTS)
+tsBearCol = input.color(color.red,  "Bearish TS color", group = grpTS)
+
+grpM1 = "Model-1 (Phase 3)"
+showM1      = input.bool(true, "Show Model-1 signals", group = grpM1)
+showEntrySL = input.bool(true, "Draw entry / stop-loss lines", group = grpM1)
+m1MinBody   = input.float(0.5, "Model-1 min body % (thickness)", minval = 0.1, maxval = 1.0, step = 0.05, group = grpM1,
+     tooltip = "RULES.md calls a 'thick' candle >= 0.70 body. Lower = more (looser) signals. Default 0.50.")
+m1Window    = input.int(24, "Setup lifetime (bars after sweep)", minval = 1, maxval = 120, group = grpM1,
+     tooltip = "How long a turtle-soup setup stays alive waiting for Model-1. A 4H CRT's Candle-3 distribution can take a full HTF candle (16 bars) — 24 gives it room. Persists across HTF candles.")
+m1KeepN     = input.int(20, "Entry/SL sets to keep", minval = 1, maxval = 100, group = grpM1)
+m1LineLen   = input.int(10, "Entry/SL line length (bars)", minval = 2, maxval = 50, group = grpM1)
+m1BearCol   = input.color(color.fuchsia, "Model-1 short marker", group = grpM1)
+m1BullCol   = input.color(color.aqua,    "Model-1 long marker",  group = grpM1)
+entryCol    = input.color(color.white,   "Entry line color",     group = grpM1)
+slCol       = input.color(color.orange,  "Stop-loss line color", group = grpM1)
+
+grpBrk = "Breaker / True MSS (Phase 4)"
+showBreaker = input.bool(true, "Show breaker block + retest", group = grpBrk)
+brkWindow   = input.int(20, "Breaker retest window (bars)", minval = 1, maxval = 120, group = grpBrk,
+     tooltip = "How long after the Model-1 displacement to watch for the breaker retest.")
+brkKeepN    = input.int(15, "Breaker zones to keep", minval = 1, maxval = 100, group = grpBrk)
+brkBullCol  = input.color(color.new(color.teal,   75), "Bullish breaker zone", group = grpBrk)
+brkBearCol  = input.color(color.new(color.maroon, 75), "Bearish breaker zone", group = grpBrk)
+brkMarkCol  = input.color(color.yellow, "Breaker entry marker", group = grpBrk)
+
+grpOTE = "OTE (Phase 5)"
+showOTE   = input.bool(true, "Show OTE zone + retracement entry", group = grpOTE)
+oteFibHi  = input.float(0.60, "OTE zone start (shallow fib)", minval = 0.1, maxval = 0.9, step = 0.05, group = grpOTE,
+     tooltip = "Retracement % of the Model-1 displacement leg where the OTE zone begins. RULES.md: 60-75% zone.")
+oteFibLo  = input.float(0.75, "OTE zone end (deep fib)", minval = 0.2, maxval = 0.95, step = 0.05, group = grpOTE,
+     tooltip = "Deeper edge of the OTE zone. A pullback into 60-75% of the displacement = optimal trade entry.")
+oteWindow = input.int(30, "OTE retrace window (bars)", minval = 1, maxval = 200, group = grpOTE,
+     tooltip = "How long after Model-1 to watch for the pullback into the OTE zone. Candle-3 pullbacks can take a while.")
+oteKeepN  = input.int(15, "OTE zones to keep", minval = 1, maxval = 100, group = grpOTE)
+oteMinLeg = input.float(0.0, "Min displacement leg (price)", minval = 0.0, group = grpOTE,
+     tooltip = "Ignore tiny displacement legs (noise). 0 = disabled.")
+// Distinct from the breaker palette: OTE boxes get a SOLID border ("outlined"),
+// breaker boxes stay soft-filled — so overlapping zones are tellable apart.
+oteBullCol  = input.color(color.new(color.blue,   84), "Bullish OTE fill",   group = grpOTE)
+oteBearCol  = input.color(color.new(color.purple, 84), "Bearish OTE fill",   group = grpOTE)
+oteBullBrdr = input.color(color.blue,   "Bullish OTE border", group = grpOTE)
+oteBearBrdr = input.color(color.purple, "Bearish OTE border", group = grpOTE)
+oteMarkCol  = input.color(color.orange, "OTE entry marker", group = grpOTE)
+oteDebug    = input.bool(false, "Show OTE debug labels (leg + fib prices)", group = grpOTE,
+     tooltip = "Prints the displacement leg endpoints and the 60% / 75% prices at each OTE, to numerically confirm the fib anchoring.")
+tgtCol      = input.color(color.green,  "Target line color", group = grpOTE)
+
+grpKOD = "KOD (Phase 6)"
+showKOD       = input.bool(true, "Show Kiss of Death (final turtle soup)", group = grpKOD)
+kodPivLen     = input.int(3, "KOD internal-liquidity pivot length", minval = 1, maxval = 20, group = grpKOD,
+     tooltip = "Strength of the local swing highs/lows the KOD sweeps (the engineered liquidity). Smaller = more sensitive.")
+kodWindow     = input.int(40, "KOD window after Model-1 (bars)", minval = 1, maxval = 300, group = grpKOD,
+     tooltip = "How long after Model-1 to keep hunting for the final turtle soup before the target is reached.")
+kodInDiscPrem = input.bool(false, "Require KOD in discount/premium half", group = grpKOD,
+     tooltip = "RULES.md: KOD commonly forms in the lower 25% (bullish) / upper 25% (bearish) of the CRT range. On = only allow the KOD once price is past the 50% level toward its trap side.")
+kodKeepN      = input.int(15, "KOD signals to keep", minval = 1, maxval = 100, group = grpKOD)
+kodBullCol    = input.color(color.green, "Bullish KOD marker", group = grpKOD)
+kodBearCol    = input.color(color.red,   "Bearish KOD marker", group = grpKOD)
+
+grpBias = "HTF Bias Filter (Phase 7)"
+useBias    = input.bool(true, "Filter setups by HTF bias (structural)", group = grpBias,
+     tooltip = "RULES.md 'Bias Rules' + MadoCRT HTF read. Bias is a STRUCTURAL read of the last closed HTF bias candle vs the one before it: (1) close BEYOND prior high/low = break -> continuation; (2) wick beyond prior high/low but close back INSIDE = rejection / HTF turtle soup -> reversal; (3) otherwise a mild close-vs-close lean. 'Wicks lie, closes confirm' -> a close beyond outranks a wick beyond. Bullish = long setups only; bearish = shorts only. Applied at each Model-1 so breaker/OTE/KOD inherit it. Turn OFF for both directions.")
+biasTF     = input.timeframe("D", "HTF bias timeframe", group = grpBias,
+     tooltip = "RULES.md 'Three Time Frame Structure': directional bias comes from a HIGHER timeframe than the dealing range (bias = Daily/Weekly, context/CRT = 4H, execution = 15m). Set this ABOVE your CRT range timeframe — reading bias off the range candle itself gives it no higher authority. Default D (Daily) for a 4H CRT range.")
+showBiasBg = input.bool(true, "Tint background by HTF bias", group = grpBias,
+     tooltip = "Faint green wash = HTF bullish, red = bearish. Confirms the filter visually: in a green zone only long setups appear, in a red zone only shorts.")
+
+grpKZ = "Kill Zones — time filter (Phase 7b)"
+useKZ    = input.bool(true, "Only show entries inside kill zones", group = grpKZ,
+     tooltip = "RULES.md 'Kill Zones' + Entry step 'Time Check: Must be within kill zone'. When ON, an entry marker (M1 / Breaker / OTE / KOD) is shown only if THAT entry's bar falls in a kill zone. The CRT sequence still forms outside — only the tradeable entries are gated (entry-time gating, per RULES.md LTF execution step). Turn OFF to show entries at any time.")
+useKZlon = input.bool(true, "London  02:00–05:00 (NY time)", group = grpKZ,
+     tooltip = "RULES.md primary kill zone: London 2:00–5:00 AM, UTC-5/-4. Anchored to America/New_York so it auto-adjusts for US daylight saving.")
+useKZny  = input.bool(true, "New York 07:00–10:00 (NY time)", group = grpKZ,
+     tooltip = "RULES.md primary kill zone: New York 7:00–10:00 AM, UTC-5/-4. Anchored to America/New_York.")
+kzTZ     = input.string("America/New_York", "Kill-zone timezone", group = grpKZ,
+     options = ["America/New_York", "GMT-5", "GMT-4"],
+     tooltip = "RULES.md: 'Algorithm functions on NY time; set chart to UTC-5 or UTC-4.' Default America/New_York applies the correct EST/EDT offset year-round regardless of your chart's own timezone.")
+showKZbg = input.bool(true, "Shade kill-zone hours", group = grpKZ,
+     tooltip = "Faint blue vertical bands mark the kill-zone hours so you can see which entries were tradeable. Independent of the bias tint (they stack). Turn the bias tint off if you want to read the kill zones cleanly.")
+
+// ----------------------------------------------------------------------------
+// HTF data  (non-repainting: last CLOSED HTF candle)
+// ----------------------------------------------------------------------------
+[h1, l1, t1] = request.security(syminfo.tickerid, htfTF,
+     [high[1], low[1], time[1]], lookahead = barmerge.lookahead_off)
+
+htfMs  = timeframe.in_seconds(htfTF) * 1000                 // one HTF candle, in ms
+newHTF = not na(t1) and ta.change(t1) != 0                  // a new HTF candle just completed
+
+// Guard: CRT timeframe must be >= chart timeframe for MTF to make sense.
+validTF = timeframe.in_seconds(htfTF) >= timeframe.in_seconds(timeframe.period)
+
+// ----------------------------------------------------------------------------
+// PHASE 7 — HTF DIRECTIONAL BIAS   [RULES.md "Bias Rules" + MadoCRT HTF read]
+//   Bias is decided on a SEPARATE, HIGHER timeframe than the CRT range (RULES.md
+//   "Three Time Frame Structure": bias = Daily/Weekly, context/CRT = 4H, exec =
+//   15m). Reading it off the range candle itself gave it no higher authority —
+//   that was the false-hope source.
+//
+//   It is a STRUCTURAL read of the last CLOSED bias candle vs the one before it,
+//   not a single close-vs-close. Priority ladder ("closes confirm" > "wicks lie"):
+//     1. Close BEYOND the prior high/low -> break -> continuation bias
+//          close > prevHigh -> bullish ;  close < prevLow -> bearish
+//     2. Wick beyond prior high/low, close back INSIDE -> rejection (HTF turtle
+//        soup) -> reversal bias
+//          wick > prevHigh (rejected) -> bearish ;  wick < prevLow -> bullish
+//     3. Stayed inside (or pierced BOTH sides) -> mild close-vs-close lean
+//   i.e. the CRT pattern applied fractally to the HTF candle: is it breaking
+//   (continuation) or wicking/turtle-souping (reversal) vs the prior candle?
+//       bullish bias -> allow LONG setups only ;  bearish -> allow SHORT only
+//   Gate applied once at each Model-1 (below) so breaker/OTE/KOD inherit it.
+//   Non-repainting: every input is [1]/[2] on the bias TF, lookahead_off.
+// ----------------------------------------------------------------------------
+[bh1, bl1, bc1, bh2, bl2, bc2] = request.security(syminfo.tickerid, biasTF,
+     [high[1], low[1], close[1], high[2], low[2], close[2]], lookahead = barmerge.lookahead_off)
+
+biasDir =
+     na(bc1) or na(bh2) or na(bl2)   ? 0  :
+     bc1 > bh2                       ?  1 :   // 1. broke & closed above prior high -> bull
+     bc1 < bl2                       ? -1 :   // 1. broke & closed below prior low  -> bear
+     (bh1 > bh2 and not (bl1 < bl2)) ? -1 :   // 2. wicked above prior high only, closed back in -> reject -> bear
+     (bl1 < bl2 and not (bh1 > bh2)) ?  1 :   // 2. wicked below prior low only,  closed back in -> reject -> bull
+     bc1 > bc2                       ?  1 :   // 3. inside / both-sides pierced -> close-vs-close lean
+     bc1 < bc2                       ? -1 : 0
+longBiasOk  = not useBias or biasDir >= 0     // bullish (or neutral) -> longs allowed
+shortBiasOk = not useBias or biasDir <= 0     // bearish (or neutral) -> shorts allowed
+
+// Background wash + a corner readout of the current HTF bias (verification aids).
+bgcolor(showBiasBg and biasDir ==  1 ? color.new(color.green, 85) : na, title = "HTF Bias Bullish")
+bgcolor(showBiasBg and biasDir == -1 ? color.new(color.red,   85) : na, title = "HTF Bias Bearish")
+
+// ----------------------------------------------------------------------------
+// PHASE 7b — KILL ZONES (time-of-day entry filter)   [RULES.md "Kill Zones"]
+//   RULES.md primary kill zones (UTC-5/-4): London 02:00-05:00, NY 07:00-10:00.
+//   "Only execute trades within kill zones ... ignore setups outside." Applied
+//   at ENTRY time (RULES.md LTF step 1: "Time Check: Must be within kill zone"),
+//   NOT at sequence inception — so each entry (M1/Breaker/OTE/KOD) is gated by
+//   ITS OWN bar's time. The CRT sequence is free to form outside a kill zone;
+//   only the tradeable entry marker is suppressed. Anchored to NY time so the
+//   windows track EST/EDT automatically ("algorithm functions on NY time").
+//   time(tf, session, tz) = bar's time if inside the session, else na → non-
+//   repainting (uses the bar's own timestamp).
+// ----------------------------------------------------------------------------
+// ":1234567" = all 7 days explicit — this is a 24/7 crypto perp, so weekend
+// bars must count as kill-zone hours too (don't rely on the session-day default).
+inLon = useKZlon and not na(time(timeframe.period, "0200-0500:1234567", kzTZ))
+inNy  = useKZny  and not na(time(timeframe.period, "0700-1000:1234567", kzTZ))
+inKZ  = inLon or inNy
+kzOk  = not useKZ or inKZ        // entry allowed? (filter off -> always true)
+
+bgcolor(showKZbg and inKZ ? color.new(color.blue, 88) : na, title = "Kill Zone")
+
+// Corner HUD: HTF bias (row 0) + current kill-zone status (row 1) — verify aids.
+var table biasTbl = table.new(position.top_center, 1, 2, border_width = 1, border_color = color.new(color.white, 40))
+if barstate.islast and (showBiasBg or showKZbg)
+    bTxt = (biasDir == 1 ? "HTF BIAS: BULLISH ▲" : biasDir == -1 ? "HTF BIAS: BEARISH ▼" : "HTF BIAS: NEUTRAL") + "  (" + biasTF + ")"
+    bBg  = biasDir == 1 ? color.green : biasDir == -1 ? color.red : color.gray
+    table.cell(biasTbl, 0, 0, bTxt + (useBias ? "" : "  (filter off)"), text_color = color.white, bgcolor = bBg, text_size = size.large)
+    kzTxt = inLon ? "KILL ZONE: LONDON ✓" : inNy ? "KILL ZONE: NEW YORK ✓" : "KILL ZONE: — outside"
+    kzBg  = inKZ ? color.blue : color.gray
+    table.cell(biasTbl, 0, 1, kzTxt + (useKZ ? "" : "  (filter off)"), text_color = color.white, bgcolor = kzBg, text_size = size.large)
+
+// ----------------------------------------------------------------------------
+// State
+// ----------------------------------------------------------------------------
+var line curHi  = na
+var line curLo  = na
+var line curMid = na
+
+var line[] histHi  = array.new_line()
+var line[] histLo  = array.new_line()
+var line[] histMid = array.new_line()
+
+var label lblHi  = na
+var label lblLo  = na
+var label lblMid = na
+
+// Turtle-soup -> Model-1 setup state. A setup PERSISTS across HTF candles
+// (Candle-2 manipulation -> Candle-3 distribution) until it CONFIRMS,
+// INVALIDATES, or TIMES OUT — it is NOT wiped on the HTF boundary.
+// The SL tracks the PROTECTED SWING: the deepest wick of the manipulation,
+// extended up to the Model-1 candle (handles W-shaped double-bottom reactions).
+// Entry/SL reference the PURGE candle (the sweep-extreme candle):
+//   long  -> entry = purge candle HIGH, SL = purge candle LOW (protected swing)
+//   short -> entry = purge candle LOW,  SL = purge candle HIGH (protected swing)
+var bool  shortActive   = false  // bearish setup pending Model-1
+var float shortSwingHi  = na     // purge candle HIGH  -> SL for a short
+var float shortPurgeLow = na     // purge candle LOW   -> entry (Model-1 must close below)
+var int   shortTsBar    = na     // bar_index of the bearish sweep
+
+var bool  longActive    = false  // bullish setup pending Model-1
+var float longSwingLo   = na     // purge candle LOW   -> SL for a long
+var float longPurgeHigh = na     // purge candle HIGH  -> entry (Model-1 must close above)
+var int   longTsBar     = na     // bar_index of the bullish sweep
+
+var line[]  m1Lines = array.new_line()
+var label[] m1Lbls  = array.new_label()
+
+// Phase 4 — Breaker / True MSS state
+var float lastDnHi  = na    // most recent down-close candle (bullish breaker candidate)
+var float lastDnLo  = na
+var int   lastDnBar = na
+var float lastUpHi  = na    // most recent up-close candle (bearish breaker candidate)
+var float lastUpLo  = na
+var int   lastUpBar = na
+
+var bool  brkLongActive  = false   // bullish breaker awaiting retest
+var float brkLongHi = na
+var float brkLongLo = na
+var int   brkLongBar = na          // Model-1 bar = retest window start
+
+var bool  brkShortActive = false   // bearish breaker awaiting retest
+var float brkShortHi = na
+var float brkShortLo = na
+var int   brkShortBar = na
+
+var box[]  brkBoxes = array.new_box()
+var line[] brkLines = array.new_line()
+
+// Phase 5 — OTE state. Armed by a Model-1 displacement; the leg extends until
+// price stops making new extremes, then we wait for a pullback into 60-75%.
+var bool  oteLongActive = false
+var float oteLegLo   = na     // long: protected swing low   = 0% anchor
+var float oteLegHi   = na     // long: displacement high     = 100% anchor (extends)
+var int   oteLongBar = na     // Model-1 bar = retrace window start
+
+var bool  oteShortActive = false
+var float oteShortLegHi = na  // short: protected swing high  = 0% anchor
+var float oteShortLegLo = na  // short: displacement low      = 100% anchor (extends)
+var int   oteShortBar   = na
+
+var box[]   oteBoxes = array.new_box()
+var line[]  oteLines = array.new_line()
+var label[] oteLbls  = array.new_label()
+
+// Phase 6 — KOD state. A sequence opens on each Model-1 and runs until the
+// target (opposite CRT level) is reached, structure breaks, or it times out.
+// The KOD is the final counter-target sweep of INTERNAL liquidity (a local
+// swing) inside that window — the last trap before delivery.
+var int   kodDir     = 0     // +1 bullish sequence (target = CRT High), -1 bearish (CRT Low)
+var int   kodSeqBar  = na    // Model-1 bar that opened the sequence
+var float kodTarget  = na    // draw on liquidity (opposite CRT level)
+var float kodInvalid = na    // protected swing; a close beyond it kills the sequence
+var bool  kodFired   = false // one KOD per sequence
+var float lastPivHi  = na    // most recent internal swing high (buyside liquidity)
+var float lastPivLo  = na    // most recent internal swing low  (sellside liquidity)
+var line[] kodLines  = array.new_line()
+
+// prune a history array down to histCount, deleting the oldest lines
+pruneLines(arr) =>
+    while array.size(arr) > histCount
+        line.delete(array.shift(arr))
+
+// prune helpers with an explicit limit (used by Model-1 objects)
+pruneLinesN(arr, lim) =>
+    while array.size(arr) > lim
+        line.delete(array.shift(arr))
+pruneLabelsN(arr, lim) =>
+    while array.size(arr) > lim
+        label.delete(array.shift(arr))
+pruneBoxesN(arr, lim) =>
+    while array.size(arr) > lim
+        box.delete(array.shift(arr))
+
+// ----------------------------------------------------------------------------
+// Build ranges on each completed HTF candle
+// ----------------------------------------------------------------------------
+if newHTF and showRange and validTF and not na(h1)
+    // 1) Freeze the previous "current" range to span only its own candle,
+    //    then move it into history.
+    if not na(curHi)
+        line.set_x2(curHi, t1)
+        array.push(histHi, curHi)
+    if not na(curLo)
+        line.set_x2(curLo, t1)
+        array.push(histLo, curLo)
+    if not na(curMid)
+        line.set_x2(curMid, t1)
+        array.push(histMid, curMid)
+
+    pruneLines(histHi)
+    pruneLines(histLo)
+    pruneLines(histMid)
+
+    // 2) Create the new current range, projected forward over N HTF candles.
+    x1  = t1
+    x2  = t1 + htfMs * projN
+    mid = (h1 + l1) / 2.0
+
+    curHi := line.new(x1, h1, x2, h1, xloc = xloc.bar_time, color = highCol, width = lineW)
+    curLo := line.new(x1, l1, x2, l1, xloc = xloc.bar_time, color = lowCol,  width = lineW)
+    curMid := show50 ? line.new(x1, mid, x2, mid, xloc = xloc.bar_time, color = midCol, width = 1, style = line.style_dashed) : na
+
+    // 3) Labels on the current range (recreated each HTF candle).
+    label.delete(lblHi)
+    label.delete(lblLo)
+    label.delete(lblMid)
+    if showLabels
+        lblHi := label.new(x2, h1, "CRT High", xloc = xloc.bar_time, style = label.style_label_left,
+             textcolor = highCol, color = color.new(highCol, 90), size = size.small)
+        lblLo := label.new(x2, l1, "CRT Low", xloc = xloc.bar_time, style = label.style_label_left,
+             textcolor = lowCol, color = color.new(lowCol, 90), size = size.small)
+        if show50
+            lblMid := label.new(x2, mid, "50%", xloc = xloc.bar_time, style = label.style_label_left,
+                 textcolor = midCol, color = color.new(midCol, 90), size = size.tiny)
+
+// ----------------------------------------------------------------------------
+// PHASES 2 & 3 — Turtle Soup -> Model-1 state machine
+//   A setup is born on a turtle-soup sweep and lives (across HTF candles)
+//   until it CONFIRMS (Model-1), INVALIDATES (close beyond the protected
+//   swing), or TIMES OUT (m1Window bars). While pending, the protected swing
+//   (SL) extends on new wicks — capturing W-shaped double-bottom reactions.
+// ----------------------------------------------------------------------------
+crtHigh = h1
+crtLow  = l1
+active  = validTF and barstate.isconfirmed and not na(crtHigh) and not na(crtLow)
+
+bool  bearTS     = false
+bool  bullTS     = false
+bool  m1ShortSig = false
+bool  m1LongSig  = false
+float m1ShortEntry = na   // entry captured at Model-1 confirmation (short)
+float m1ShortSL    = na   // SL    captured at Model-1 confirmation (short)
+float m1LongEntry  = na   // entry captured at Model-1 confirmation (long)
+float m1LongSL     = na   // SL    captured at Model-1 confirmation (long)
+
+// Track the most recent up/down candle (breaker-block candidates for Phase 4).
+if active
+    if close < open
+        lastDnHi  := high
+        lastDnLo  := low
+        lastDnBar := bar_index
+    else if close > open
+        lastUpHi  := high
+        lastUpLo  := low
+        lastUpBar := bar_index
+
+// ===== SHORT setup (sweep of CRT High -> expect down) =====
+// Purge candle = the sweep-extreme candle (highest high). Entry = its LOW,
+// SL = its HIGH. Both track the extreme candle and extend on new highs.
+if active
+    if not shortActive
+        // Idle: remember the highest-high (purge) candle above CRT High.
+        if high > crtHigh
+            if na(shortSwingHi) or high > shortSwingHi
+                shortSwingHi  := high
+                shortPurgeLow := low
+        else
+            shortSwingHi  := na
+            shortPurgeLow := na
+        // Trigger: swept the high but CLOSED back inside -> bearish turtle soup.
+        if high > crtHigh and close < crtHigh and not na(shortSwingHi)
+            bearTS      := true
+            shortActive := true
+            shortTsBar  := bar_index
+    else
+        // Pending: maintain the purge candle, invalidate, or time out.
+        if close > shortSwingHi
+            shortActive   := false       // closed above protected swing -> broken
+            shortSwingHi  := na
+            shortPurgeLow := na
+        else if high > shortSwingHi
+            shortSwingHi  := high         // deeper buyside sweep -> new purge candle
+            shortPurgeLow := low
+        if shortActive and (bar_index - shortTsBar) > m1Window
+            shortActive   := false        // timed out
+            shortSwingHi  := na
+            shortPurgeLow := na
+        // Model-1: a later thick DOWN-close candle closes BELOW the purge candle low.
+        if shortActive and bar_index > shortTsBar
+            rngS = high - low
+            thickS = rngS > 0 and math.abs(close - open) / rngS >= m1MinBody
+            if thickS and close < open and close < shortPurgeLow
+                m1ShortSig    := true
+                m1ShortEntry  := shortPurgeLow   // entry = purge candle low
+                m1ShortSL     := shortSwingHi    // SL    = purge candle high
+                shortActive   := false
+                shortSwingHi  := na
+                shortPurgeLow := na
+
+// ===== LONG setup (sweep of CRT Low -> expect up) =====
+// Purge candle = the sweep-extreme candle (deepest low). Entry = its HIGH,
+// SL = its LOW. Both track the extreme candle and extend on new lows.
+if active
+    if not longActive
+        // Idle: remember the deepest-low (purge) candle below CRT Low.
+        if low < crtLow
+            if na(longSwingLo) or low < longSwingLo
+                longSwingLo   := low
+                longPurgeHigh := high
+        else
+            longSwingLo   := na
+            longPurgeHigh := na
+        // Trigger: swept the low but CLOSED back inside -> bullish turtle soup.
+        if low < crtLow and close > crtLow and not na(longSwingLo)
+            bullTS     := true
+            longActive := true
+            longTsBar  := bar_index
+    else
+        // Pending: maintain the purge candle, invalidate, or time out.
+        if close < longSwingLo
+            longActive    := false        // closed below protected swing -> broken
+            longSwingLo   := na
+            longPurgeHigh := na
+        else if low < longSwingLo
+            longSwingLo   := low          // deeper sellside sweep -> new purge candle
+            longPurgeHigh := high
+        if longActive and (bar_index - longTsBar) > m1Window
+            longActive    := false        // timed out
+            longSwingLo   := na
+            longPurgeHigh := na
+        // Model-1: a later thick UP-close candle closes ABOVE the purge candle high.
+        if longActive and bar_index > longTsBar
+            rngL = high - low
+            thickL = rngL > 0 and math.abs(close - open) / rngL >= m1MinBody
+            if thickL and close > open and close > longPurgeHigh
+                m1LongSig     := true
+                m1LongEntry   := longPurgeHigh   // entry = purge candle high
+                m1LongSL      := longSwingLo     // SL    = purge candle low
+                longActive    := false
+                longSwingLo   := na
+                longPurgeHigh := na
+
+// ----------------------------------------------------------------------------
+// PHASE 7 — apply the HTF bias gate at the Model-1 (the single arming point).
+//   Suppressing a counter-bias Model-1 here cascades to breaker / OTE / KOD,
+//   which all arm off m1LongSig / m1ShortSig — so the whole entry stack inherits
+//   the bias decision from one place. The internal TS->M1 state is left intact
+//   (only the emitted signal is masked). longBiasOk/shortBiasOk already fold in
+//   the useBias toggle, so this is a no-op when the filter is off.
+// ----------------------------------------------------------------------------
+m1LongSig  := m1LongSig  and longBiasOk
+m1ShortSig := m1ShortSig and shortBiasOk
+
+// --- Turtle-soup markers ---
+plotshape(bearTS and showTS and shortBiasOk, title = "Bearish Turtle Soup", style = shape.triangledown, location = location.abovebar, color = tsBearCol, textcolor = tsBearCol, size = size.small, text = "TS")
+plotshape(bullTS and showTS and longBiasOk,  title = "Bullish Turtle Soup", style = shape.triangleup,   location = location.belowbar, color = tsBullCol, textcolor = tsBullCol, size = size.small, text = "TS")
+
+// --- Model-1 entry / stop-loss ---
+// Entry-time kill-zone gate (kzOk): the sequence may arm off m1LongSig/m1ShortSig
+// regardless of time, but the *displayed entry* only appears if this bar is in a
+// kill zone. That is why kzOk masks the DISPLAY here, not the signal itself.
+if m1ShortSig and kzOk and showM1 and showEntrySL
+    eS = m1ShortEntry    // entry = purge candle low
+    sS = m1ShortSL       // SL    = purge candle high
+    leS = line.new(bar_index, eS, bar_index + m1LineLen, eS, xloc = xloc.bar_index, color = entryCol, width = 1)
+    lsS = line.new(bar_index, sS, bar_index + m1LineLen, sS, xloc = xloc.bar_index, color = slCol, width = 1, style = line.style_dashed)
+    array.push(m1Lines, leS)
+    array.push(m1Lines, lsS)
+    lbS = label.new(bar_index + m1LineLen, sS, "SL", xloc = xloc.bar_index, style = label.style_label_left, color = color.new(slCol, 80), textcolor = slCol, size = size.tiny)
+    array.push(m1Lbls, lbS)
+    pruneLinesN(m1Lines, m1KeepN * 2)
+    pruneLabelsN(m1Lbls, m1KeepN)
+
+if m1LongSig and kzOk and showM1 and showEntrySL
+    eL = m1LongEntry     // entry = purge candle high
+    sL = m1LongSL        // SL    = purge candle low
+    leL = line.new(bar_index, eL, bar_index + m1LineLen, eL, xloc = xloc.bar_index, color = entryCol, width = 1)
+    lsL = line.new(bar_index, sL, bar_index + m1LineLen, sL, xloc = xloc.bar_index, color = slCol, width = 1, style = line.style_dashed)
+    array.push(m1Lines, leL)
+    array.push(m1Lines, lsL)
+    lbL = label.new(bar_index + m1LineLen, sL, "SL", xloc = xloc.bar_index, style = label.style_label_left, color = color.new(slCol, 80), textcolor = slCol, size = size.tiny)
+    array.push(m1Lbls, lbL)
+    pruneLinesN(m1Lines, m1KeepN * 2)
+    pruneLabelsN(m1Lbls, m1KeepN)
+
+plotshape(m1ShortSig and kzOk and showM1, title = "Model-1 Short", style = shape.diamond, location = location.abovebar, color = m1BearCol, textcolor = m1BearCol, size = size.tiny, text = "M1")
+plotshape(m1LongSig  and kzOk and showM1, title = "Model-1 Long",  style = shape.diamond, location = location.belowbar, color = m1BullCol, textcolor = m1BullCol, size = size.tiny, text = "M1")
+
+// ----------------------------------------------------------------------------
+// PHASE 4 — Breaker block / True MSS (retest entry after Model-1 displacement)
+//   The last opposite-colour candle before the Model-1 displacement becomes the
+//   breaker zone; price returning to RETEST it = a second (confirmation) entry.
+// ----------------------------------------------------------------------------
+bool brkLongSig  = false
+bool brkShortSig = false
+
+// A Model-1 marks the breaker (last opposite candle before displacement) + zone.
+if m1LongSig and showBreaker and not na(lastDnBar)
+    brkLongActive := true
+    brkLongHi  := lastDnHi
+    brkLongLo  := lastDnLo
+    brkLongBar := bar_index                     // Model-1 bar = retest window start
+    bxL = box.new(lastDnBar, lastDnHi, bar_index + brkWindow, lastDnLo, xloc = xloc.bar_index, border_color = brkBullCol, bgcolor = brkBullCol)
+    array.push(brkBoxes, bxL)
+    pruneBoxesN(brkBoxes, brkKeepN)
+
+if m1ShortSig and showBreaker and not na(lastUpBar)
+    brkShortActive := true
+    brkShortHi  := lastUpHi
+    brkShortLo  := lastUpLo
+    brkShortBar := bar_index
+    bxS = box.new(lastUpBar, lastUpHi, bar_index + brkWindow, lastUpLo, xloc = xloc.bar_index, border_color = brkBearCol, bgcolor = brkBearCol)
+    array.push(brkBoxes, bxS)
+    pruneBoxesN(brkBoxes, brkKeepN)
+
+// Bullish breaker retest: price pulls back DOWN into the zone (support).
+if brkLongActive and active
+    if bar_index - brkLongBar > brkWindow
+        brkLongActive := false                  // timed out
+    else if close < brkLongLo
+        brkLongActive := false                  // closed through -> breaker failed
+    else if bar_index > brkLongBar and low <= brkLongHi
+        brkLongSig    := kzOk                     // retested the breaker zone (entry-time KZ gate)
+        brkLongActive := false
+
+// Bearish breaker retest: price rallies back UP into the zone (resistance).
+if brkShortActive and active
+    if bar_index - brkShortBar > brkWindow
+        brkShortActive := false
+    else if close > brkShortHi
+        brkShortActive := false
+    else if bar_index > brkShortBar and high >= brkShortLo
+        brkShortSig    := kzOk                    // entry-time KZ gate
+        brkShortActive := false
+
+// Draw breaker retest entry / stop-loss.
+if brkLongSig and showBreaker and showEntrySL
+    eB = brkLongHi          // entry = top of breaker zone
+    sB = brkLongLo          // SL    = bottom of breaker zone
+    leB = line.new(bar_index, eB, bar_index + m1LineLen, eB, xloc = xloc.bar_index, color = entryCol, width = 1)
+    lsB = line.new(bar_index, sB, bar_index + m1LineLen, sB, xloc = xloc.bar_index, color = slCol, width = 1, style = line.style_dashed)
+    array.push(brkLines, leB)
+    array.push(brkLines, lsB)
+    pruneLinesN(brkLines, brkKeepN * 2)
+
+if brkShortSig and showBreaker and showEntrySL
+    eB = brkShortLo         // entry = bottom of breaker zone
+    sB = brkShortHi         // SL    = top of breaker zone
+    leB = line.new(bar_index, eB, bar_index + m1LineLen, eB, xloc = xloc.bar_index, color = entryCol, width = 1)
+    lsB = line.new(bar_index, sB, bar_index + m1LineLen, sB, xloc = xloc.bar_index, color = slCol, width = 1, style = line.style_dashed)
+    array.push(brkLines, leB)
+    array.push(brkLines, lsB)
+    pruneLinesN(brkLines, brkKeepN * 2)
+
+plotshape(brkLongSig  and showBreaker, title = "Breaker Long",  style = shape.square, location = location.belowbar, color = brkMarkCol, textcolor = brkMarkCol, size = size.tiny, text = "BRK")
+plotshape(brkShortSig and showBreaker, title = "Breaker Short", style = shape.square, location = location.abovebar, color = brkMarkCol, textcolor = brkMarkCol, size = size.tiny, text = "BRK")
+
+// ----------------------------------------------------------------------------
+// PHASE 5 — OTE (Optimal Trade Entry)   [RULES.md: TSQ Phase 4, RomeoTPT EP7]
+//   After the Model-1 displacement, price PULLS BACK before continuing. RULES.md
+//   "Phase 4: OTE" — enter in the 60-75% Fibonacci retracement zone of the
+//   displacement leg. Requirements it lists: liquidity purged before the retrace
+//   (our turtle soup) + a valid pullback into the zone. SL below/above the
+//   protected swing; target = CRT high/low (the draw on liquidity).
+//     - Long  leg: protected swing LOW (0%)  -> displacement HIGH (100%);
+//                  OTE = pull back DOWN into 60-75% of that up-leg.
+//     - Short leg: protected swing HIGH (0%) -> displacement LOW (100%);
+//                  OTE = pull back UP into 60-75% of that down-leg.
+//   RULES.md (RomeoTPT EP7): OTE lives in Candle 3; in a STRONG trend price may
+//   not retrace that deep (25-38%) — then no OTE tags and price simply continues.
+//   The displacement extreme keeps extending until price stops making new
+//   highs/lows, then the zone freezes and we wait for the pullback tag.
+//   Non-repainting: everything evaluates on CLOSED bars (active).
+// ----------------------------------------------------------------------------
+bool  oteLongSig   = false
+bool  oteShortSig  = false
+float oteLongEntry = na
+float oteLongSLv   = na
+float oteLongTgt   = na
+float oteLongZTop  = na
+float oteLongZBot  = na
+float oteShortEntry = na
+float oteShortSLv   = na
+float oteShortTgt   = na
+float oteShortZTop  = na
+float oteShortZBot  = na
+float oteLongLegLoV  = na    // debug: leg endpoints captured at fire
+float oteLongLegHiV  = na
+float oteShortLegLoV = na
+float oteShortLegHiV = na
+
+// Arm an OTE tracker on each Model-1 displacement (same trigger the breaker uses
+// — RULES.md: "breaker + OTE combine at the same zone = highest probability").
+if m1LongSig and showOTE
+    oteLongActive := true
+    oteLegLo   := m1LongSL       // protected swing low  = 0% anchor
+    oteLegHi   := high           // displacement high    = 100% anchor (extends)
+    oteLongBar := bar_index
+if m1ShortSig and showOTE
+    oteShortActive := true
+    oteShortLegHi := m1ShortSL    // protected swing high = 0% anchor
+    oteShortLegLo := low          // displacement low     = 100% anchor (extends)
+    oteShortBar   := bar_index
+
+// Long OTE: extend the up-leg, then wait for a pullback DOWN into 60-75%.
+if oteLongActive and active
+    newHi = high > oteLegHi
+    if newHi
+        oteLegHi := high
+    leg     = oteLegHi - oteLegLo
+    zoneTop = oteLegHi - oteFibHi * leg      // 60% level (shallow edge, upper price)
+    zoneBot = oteLegHi - oteFibLo * leg      // 75% level (deep edge, lower price)
+    if close < oteLegLo
+        oteLongActive := false               // retraced past the protected swing -> dead
+    else if bar_index - oteLongBar > oteWindow
+        oteLongActive := false               // timed out
+    else if not newHi and bar_index > oteLongBar and leg > oteMinLeg and low <= zoneTop
+        oteLongSig    := kzOk                                           // entry-time KZ gate
+        oteLongEntry  := oteLegHi - (oteFibHi + oteFibLo) / 2.0 * leg   // OTE mid (~67.5%)
+        oteLongSLv    := oteLegLo
+        oteLongTgt    := crtHigh
+        oteLongZTop   := zoneTop
+        oteLongZBot   := zoneBot
+        oteLongLegLoV := oteLegLo
+        oteLongLegHiV := oteLegHi
+        oteLongActive := false
+
+// Short OTE: extend the down-leg, then wait for a pullback UP into 60-75%.
+if oteShortActive and active
+    newLo = low < oteShortLegLo
+    if newLo
+        oteShortLegLo := low
+    legS     = oteShortLegHi - oteShortLegLo
+    zoneBotS = oteShortLegLo + oteFibHi * legS   // 60% level (shallow edge, lower price)
+    zoneTopS = oteShortLegLo + oteFibLo * legS   // 75% level (deep edge, upper price)
+    if close > oteShortLegHi
+        oteShortActive := false
+    else if bar_index - oteShortBar > oteWindow
+        oteShortActive := false
+    else if not newLo and bar_index > oteShortBar and legS > oteMinLeg and high >= zoneBotS
+        oteShortSig    := kzOk                                          // entry-time KZ gate
+        oteShortEntry  := oteShortLegLo + (oteFibHi + oteFibLo) / 2.0 * legS
+        oteShortSLv    := oteShortLegHi
+        oteShortTgt    := crtLow
+        oteShortZTop   := zoneTopS
+        oteShortZBot   := zoneBotS
+        oteShortLegLoV := oteShortLegLo
+        oteShortLegHiV := oteShortLegHi
+        oteShortActive := false
+
+// Draw OTE zone box + entry / stop / target.
+if oteLongSig and showOTE
+    bx = box.new(oteLongBar, oteLongZTop, bar_index + m1LineLen, oteLongZBot, xloc = xloc.bar_index, border_color = oteBullBrdr, bgcolor = oteBullCol)
+    array.push(oteBoxes, bx)
+    pruneBoxesN(oteBoxes, oteKeepN)
+    if oteDebug
+        dl = label.new(bar_index + m1LineLen, oteLongZTop, "OTE▲ leg " + str.tostring(oteLongLegLoV, format.mintick) + "→" + str.tostring(oteLongLegHiV, format.mintick) + "\n60% " + str.tostring(oteLongZTop, format.mintick) + "   75% " + str.tostring(oteLongZBot, format.mintick), xloc = xloc.bar_index, style = label.style_label_left, color = color.new(oteBullBrdr, 15), textcolor = color.white, size = size.small)
+        array.push(oteLbls, dl)
+        pruneLabelsN(oteLbls, oteKeepN)
+    if showEntrySL
+        le = line.new(bar_index, oteLongEntry, bar_index + m1LineLen, oteLongEntry, xloc = xloc.bar_index, color = entryCol, width = 1)
+        ls = line.new(bar_index, oteLongSLv,   bar_index + m1LineLen, oteLongSLv,   xloc = xloc.bar_index, color = slCol,  width = 1, style = line.style_dashed)
+        lt = line.new(bar_index, oteLongTgt,   bar_index + m1LineLen, oteLongTgt,   xloc = xloc.bar_index, color = tgtCol, width = 1, style = line.style_dotted)
+        array.push(oteLines, le)
+        array.push(oteLines, ls)
+        array.push(oteLines, lt)
+        pruneLinesN(oteLines, oteKeepN * 3)
+
+if oteShortSig and showOTE
+    bx = box.new(oteShortBar, oteShortZTop, bar_index + m1LineLen, oteShortZBot, xloc = xloc.bar_index, border_color = oteBearBrdr, bgcolor = oteBearCol)
+    array.push(oteBoxes, bx)
+    pruneBoxesN(oteBoxes, oteKeepN)
+    if oteDebug
+        dl = label.new(bar_index + m1LineLen, oteShortZBot, "OTE▼ leg " + str.tostring(oteShortLegHiV, format.mintick) + "→" + str.tostring(oteShortLegLoV, format.mintick) + "\n60% " + str.tostring(oteShortZBot, format.mintick) + "   75% " + str.tostring(oteShortZTop, format.mintick), xloc = xloc.bar_index, style = label.style_label_left, color = color.new(oteBearBrdr, 15), textcolor = color.white, size = size.small)
+        array.push(oteLbls, dl)
+        pruneLabelsN(oteLbls, oteKeepN)
+    if showEntrySL
+        le = line.new(bar_index, oteShortEntry, bar_index + m1LineLen, oteShortEntry, xloc = xloc.bar_index, color = entryCol, width = 1)
+        ls = line.new(bar_index, oteShortSLv,   bar_index + m1LineLen, oteShortSLv,   xloc = xloc.bar_index, color = slCol,  width = 1, style = line.style_dashed)
+        lt = line.new(bar_index, oteShortTgt,   bar_index + m1LineLen, oteShortTgt,   xloc = xloc.bar_index, color = tgtCol, width = 1, style = line.style_dotted)
+        array.push(oteLines, le)
+        array.push(oteLines, ls)
+        array.push(oteLines, lt)
+        pruneLinesN(oteLines, oteKeepN * 3)
+
+plotshape(oteLongSig  and showOTE, title = "OTE Long",  style = shape.circle, location = location.belowbar, color = oteMarkCol, textcolor = oteMarkCol, size = size.tiny, text = "OTE")
+plotshape(oteShortSig and showOTE, title = "OTE Short", style = shape.circle, location = location.abovebar, color = oteMarkCol, textcolor = oteMarkCol, size = size.tiny, text = "OTE")
+
+// ----------------------------------------------------------------------------
+// PHASE 6 — KOD (Kiss of Death)   [RULES.md "Kiss of Death", RomeoTPT EP2]
+//   The FINAL turtle soup before price delivers into the target (the opposite
+//   CRT level / draw on liquidity). RULES.md: "there's always a kiss of death
+//   turtle soup before dumping into the target." Sequence:
+//       TS -> Model-1 -> 50% bounce -> KOD turtle soup -> DUMP/PUMP to target.
+//   Mechanically the KOD is a COUNTER-TARGET sweep of INTERNAL liquidity (a
+//   recent local swing) that traps breakout traders, then reverses toward the
+//   target — "KOD below old low = BUY, KOD above old high = SELL" (RULES.md).
+//     - Bullish seq (target CRT High): sweep a local LOW then close back above.
+//     - Bearish seq (target CRT Low) : sweep a local HIGH then close back below.
+//   Risk = beyond the KOD wick; target = the CRT level (RULES.md "risk above
+//   KOD, reward at target"). The counter-target geometry places the KOD at a
+//   retracement extreme by construction (the "50% bounce" in the sequence).
+//   A sequence is opened by each Model-1 and fires at most ONE KOD.
+//   Non-repainting: pivots confirm after kodPivLen bars; signals on closed bars.
+// ----------------------------------------------------------------------------
+// Internal liquidity = confirmed local swings (engineered stop pools).
+ph = ta.pivothigh(high, kodPivLen, kodPivLen)
+pl = ta.pivotlow(low,  kodPivLen, kodPivLen)
+if not na(ph)
+    lastPivHi := ph
+if not na(pl)
+    lastPivLo := pl
+
+// Open / refresh a sequence on each Model-1 displacement.
+if m1LongSig and showKOD
+    kodDir     := 1
+    kodSeqBar  := bar_index
+    kodTarget  := crtHigh
+    kodInvalid := m1LongSL
+    kodFired   := false
+if m1ShortSig and showKOD
+    kodDir     := -1
+    kodSeqBar  := bar_index
+    kodTarget  := crtLow
+    kodInvalid := m1ShortSL
+    kodFired   := false
+
+bool  kodLongSig  = false
+bool  kodShortSig = false
+float kodSLv  = na
+float kodTgtv = na
+
+if kodDir != 0 and active
+    // End the sequence: target reached, structure broken, or timed out.
+    ended = false
+    if kodDir == 1 and (high >= kodTarget or close < kodInvalid)
+        ended := true
+    if kodDir == -1 and (low <= kodTarget or close > kodInvalid)
+        ended := true
+    if bar_index - kodSeqBar > kodWindow
+        ended := true
+
+    // The KOD: a counter-target sweep of internal liquidity that reverses back
+    // toward the target. Optionally require it in the discount/premium half.
+    disc = (crtHigh + crtLow) / 2.0
+    if not ended and not kodFired and bar_index > kodSeqBar
+        if kodDir == 1 and not na(lastPivLo)
+            locOk = not kodInDiscPrem or close < disc
+            if low < lastPivLo and close > lastPivLo and close > open and locOk
+                kodLongSig := kzOk         // entry-time KZ gate (event still recorded below)
+                kodFired   := true          // one KOD per sequence, tradeable or not
+                kodSLv     := low          // risk below the KOD wick
+                kodTgtv    := kodTarget     // reward at CRT High
+        else if kodDir == -1 and not na(lastPivHi)
+            locOk = not kodInDiscPrem or close > disc
+            if high > lastPivHi and close < lastPivHi and close < open and locOk
+                kodShortSig := kzOk         // entry-time KZ gate (event still recorded below)
+                kodFired    := true          // one KOD per sequence, tradeable or not
+                kodSLv      := high         // risk above the KOD wick
+                kodTgtv     := kodTarget      // reward at CRT Low
+
+    if ended
+        kodDir   := 0
+        kodFired := false
+
+// Draw KOD stop / target lines.
+if (kodLongSig or kodShortSig) and showKOD and showEntrySL
+    ls = line.new(bar_index, kodSLv,  bar_index + m1LineLen, kodSLv,  xloc = xloc.bar_index, color = slCol,  width = 1, style = line.style_dashed)
+    lt = line.new(bar_index, kodTgtv, bar_index + m1LineLen, kodTgtv, xloc = xloc.bar_index, color = tgtCol, width = 1, style = line.style_dotted)
+    array.push(kodLines, ls)
+    array.push(kodLines, lt)
+    pruneLinesN(kodLines, kodKeepN * 2)
+
+plotshape(kodLongSig  and showKOD, title = "KOD Long",  style = shape.xcross, location = location.belowbar, color = kodBullCol, textcolor = kodBullCol, size = size.small, text = "KOD")
+plotshape(kodShortSig and showKOD, title = "KOD Short", style = shape.xcross, location = location.abovebar, color = kodBearCol, textcolor = kodBearCol, size = size.small, text = "KOD")
+
+// ----------------------------------------------------------------------------
+// Warning if the CRT timeframe is not higher than the chart timeframe
+// ----------------------------------------------------------------------------
+var label warnLbl = na
+if barstate.islast
+    label.delete(warnLbl)
+    if not validTF
+        warnLbl := label.new(bar_index, high, "⚠ CRT timeframe (" + htfTF + ") must be ≥ chart timeframe.\nSwitch the chart to a lower timeframe.",
+             style = label.style_label_down, color = color.orange, textcolor = color.black, size = size.normal)

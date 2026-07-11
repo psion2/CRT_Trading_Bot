@@ -1,0 +1,41 @@
+//@version=6
+indicator(title="CRT Part 1 — 4H Data Reference Points", shorttitle="CRT P1", overlay=true, format=format.price, precision=2)
+
+// ─── Inputs ──────────────────────────────────────────────────────────────
+htfRes = input.string("240", "HTF Resolution", options=["60","120","240","480","D"], group="Core")
+st     = input.bool(true,    "Show 4H High/Low?", group="Display")
+tt     = input.bool(false,   "Show 1H High/Low?", group="Display")
+
+// ══════════════════════════════════════════════════════════════════════════
+//  4H DATA — exactly like the reference indicator
+// ══════════════════════════════════════════════════════════════════════════
+
+hh = request.security(syminfo.tickerid, htfRes, high)
+hl = request.security(syminfo.tickerid, htfRes, low)
+ho = request.security(syminfo.tickerid, htfRes, open)
+hc = request.security(syminfo.tickerid, htfRes, close)
+
+// Offsets for previous 4H candles (for CRT pattern detection later)
+hh1 = request.security(syminfo.tickerid, htfRes, high[1])
+hl1 = request.security(syminfo.tickerid, htfRes, low[1])
+hh2 = request.security(syminfo.tickerid, htfRes, high[2])
+hl2 = request.security(syminfo.tickerid, htfRes, low[2])
+hh3 = request.security(syminfo.tickerid, htfRes, high[3])
+hl3 = request.security(syminfo.tickerid, htfRes, low[3])
+
+// ══════════════════════════════════════════════════════════════════════════
+//  PLOTS — same as the reference indicator
+// ══════════════════════════════════════════════════════════════════════════
+
+plot(st and hh ? hh : na, "4H High", color=orange, style=plot.style_circles, linewidth=2)
+plot(st and hl ? hl : na, "4H Low",  color=yellow, style=plot.style_circles, linewidth=2)
+plot(st and ho ? ho : na, "4H Open", color=gray,   style=plot.style_circles, linewidth=1)
+plot(st and hc ? hc : na, "4H Close",color=white,  style=plot.style_cross,  linewidth=1)
+
+// Previous bar reference points
+plot(st and hh1 ? hh1 : na, "C3 High", color=color.new(color.orange, 50), style=plot.style_circles, linewidth=1)
+plot(st and hl1 ? hl1 : na, "C3 Low",  color=color.new(color.yellow, 50), style=plot.style_circles, linewidth=1)
+
+// 1H data
+plot(tt ? request.security(syminfo.tickerid, "60", high) : na, "1H High", color=red,   style=plot.style_circles, linewidth=1)
+plot(tt ? request.security(syminfo.tickerid, "60", low)  : na, "1H Low",  color=green, style=plot.style_circles, linewidth=1)
