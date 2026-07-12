@@ -72,7 +72,7 @@
 //   below) suppresses whichever side is counter to the structural HTF bias.
 // ============================================================================
 
-indicator("CRT v2 — CRT + TS + M1 + Breaker + OTE + KOD + Bias + KZ", overlay = true, max_lines_count = 500, max_boxes_count = 500, max_labels_count = 500)
+indicator("CRT v2 — CRT + TS + M1 + Breaker + OTE + KOD + FVG + Bias + KZ + DLP + Ref", overlay = true, max_lines_count = 500, max_boxes_count = 500, max_labels_count = 500)
 
 // ----------------------------------------------------------------------------
 // Inputs
@@ -103,8 +103,8 @@ tsBearCol = input.color(color.red,  "Bearish TS color", group = grpTS)
 grpM1 = "Model-1 (Phase 3)"
 showM1      = input.bool(true, "Show Model-1 signals", group = grpM1)
 showEntrySL = input.bool(true, "Draw entry / stop-loss lines", group = grpM1)
-m1MinBody   = input.float(0.5, "Model-1 min body % (thickness)", minval = 0.1, maxval = 1.0, step = 0.05, group = grpM1,
-     tooltip = "RULES.md calls a 'thick' candle >= 0.70 body. Lower = more (looser) signals. Default 0.50.")
+m1MinBody   = input.float(0.7, "Model-1 min body % (thickness)", minval = 0.1, maxval = 1.0, step = 0.05, group = grpM1,
+     tooltip = "RULES.md calls a 'thick' candle >= 0.70 body. Lower = more (looser) signals. Default 0.70.")
 m1Window    = input.int(24, "Setup lifetime (bars after sweep)", minval = 1, maxval = 120, group = grpM1,
      tooltip = "How long a turtle-soup setup stays alive waiting for Model-1. A 4H CRT's Candle-3 distribution can take a full HTF candle (16 bars) — 24 gives it room. Persists across HTF candles.")
 m1KeepN     = input.int(20, "Entry/SL sets to keep", minval = 1, maxval = 100, group = grpM1)
@@ -178,6 +178,37 @@ kzTZ     = input.string("America/New_York", "Kill-zone timezone", group = grpKZ,
 showKZbg = input.bool(true, "Shade kill-zone hours", group = grpKZ,
      tooltip = "Faint blue vertical bands mark the kill-zone hours so you can see which entries were tradeable. Independent of the bias tint (they stack). Turn the bias tint off if you want to read the kill zones cleanly.")
 
+grpDOW = "Time-of-Week Filter (Phase 7c)"
+useDOW     = input.bool(false, "Filter by day-of-week", group = grpDOW,
+     tooltip = "RULES.md: Monday = often fake high (lower probability). Thursday/Friday + Model-1 = highest conviction. When ON, only shows entries on selected days.")
+dowFilter = input.string("any", "Allowed days", options = ["any", "thu_fri_only", "tue_fri", "avoid_monday"], group = grpDOW,
+     tooltip = "any = all days. thu_fri_only = Thursday + Friday only (highest conviction per rules). tue_fri = Tuesday through Friday. avoid_monday = all except Monday.")
+
+grpFVG = "FVG Detection (Confluence)"
+showFVG    = input.bool(true, "Show Fair Value Gaps", group = grpFVG,
+     tooltip = "RULES.md: 'Model-1 + FVG = highest probability'. Detects 3-candle imbalances (gaps) that price may rebalance.")
+fvgKeepN   = input.int(10, "FVG zones to keep", minval = 1, maxval = 50, group = grpFVG)
+fvgBullCol = input.color(color.new(color.green, 85), "Bullish FVG fill", group = grpFVG)
+fvgBearCol = input.color(color.new(color.red, 85), "Bearish FVG fill", group = grpFVG)
+fvgBullBrdr = input.color(color.green, "Bullish FVG border", group = grpFVG)
+fvgBearBrdr = input.color(color.red, "Bearish FVG border", group = grpFVG)
+
+grpDLP = "Draw Liquidity Priority"
+useDLP     = input.bool(false, "Enable Draw Liquidity Priority filter", group = grpDLP,
+     tooltip = "RULES.md Tape Reading: 'The draw liquidity is paramount.' When ON, suppresses setups that trade AGAINST the draw-on-liquidity direction. Requires a target level to be set.")
+dlpTarget  = input.float(0.0, "Draw-on-liquidity target price", minval = 0.0, group = grpDLP,
+     tooltip = "The price level that is the draw on liquidity (target). Long setups allowed when price is below target; short setups when above. Set to 0 to disable.")
+dlpAutoFromHTF = input.bool(false, "Auto-target from HTF CRT High/Low", group = grpDLP,
+     tooltip = "When ON, automatically uses the CRT High as bearish draw (sell toward) and CRT Low as bullish draw (buy toward). Overrides dlpTarget.")
+
+grpRef = "Reference Levels"
+showWkOpen = input.bool(false, "Show weekly open line", group = grpRef,
+     tooltip = "RULES.md: 'Weekly candle open = Sunday 5:00 PM NY time'. Plots the current week's opening price as a reference level.")
+showDayOpen = input.bool(false, "Show daily open line", group = grpRef,
+     tooltip = "RULES.md: 'Daily candle open = Monday midnight NY time'. Plots the current day's opening price as a reference level.")
+wkOpenCol  = input.color(color.yellow, "Weekly open color", group = grpRef)
+dayOpenCol = input.color(color.aqua, "Daily open color", group = grpRef)
+
 // ----------------------------------------------------------------------------
 // HTF data  (non-repainting: last CLOSED HTF candle)
 // ----------------------------------------------------------------------------
@@ -189,6 +220,42 @@ newHTF = not na(t1) and ta.change(t1) != 0                  // a new HTF candle 
 
 // Guard: CRT timeframe must be >= chart timeframe for MTF to make sense.
 validTF = timeframe.in_seconds(htfTF) >= timeframe.in_seconds(timeframe.period)
+
+// --- HTF data for 2-Candle CRT and Inside-Bar CRT (Steps 5 & 6) ---
+// Fetch the last 3 completed HTF candles for pattern detection.
+[oH2, oL2, oH1, oL1, oC1, oH0, oL0, oC0] = request.security(syminfo.tickerid, htfTF,
+     [open[3], low[3], high[2], low[2], close[2], high[1], low[1], close[1]],
+     lookahead = barmerge.lookahead_off)
+
+// 2-Candle CRT: Candle 1 = range (oH1/oL1), Candle 2 = purge + distribute in same candle
+// Bullish: C2 Low < C1 Low AND C2 Close > C1 High  (purge low, close above range)
+// Bearish: C2 High > C1 High AND C2 Close < C1 Low (purge high, close below range)
+twoCandleBull = not na(oH1) and not na(oL1) and not na(oL0) and not na(oC0) and oL0 < oL1 and oC0 > oH1
+twoCandleBear = not na(oH1) and not na(oL1) and not na(oL0) and not na(oC0) and oH0 > oH1 and oC0 < oL1
+twoCandleDir  = twoCandleBull ? 1 : twoCandleBear ? -1 : 0
+
+// Inside-Bar CRT: scan back for a range candle followed by N inside bars, then breakout.
+// Uses the last 5 completed HTF candles. Pattern: range candle[2] -> inside candles[1] -> breakout[0].
+insideBarBull = false
+insideBarBear = false
+insideBarRangeHi = float(na)
+insideBarRangeLo = float(na)
+if not na(oH2) and not na(oL2) and not na(oH1) and not na(oL1) and not na(oH0) and not na(oL0)
+    // Check if candle[1] is inside candle[2]'s range
+    if oH1 <= oH2 and oL1 >= oL2
+        // Candle[0] breaks out
+        if oH0 > oH2 and oC0 > oH2
+            insideBarBull := true
+            insideBarRangeHi := oH2
+            insideBarRangeLo := oL2
+        else if oL0 < oL2 and oC0 < oL2
+            insideBarBear := true
+            insideBarRangeHi := oH2
+            insideBarRangeLo := oL2
+
+// --- Weekly / Daily open data (Step 12) ---
+[dOpen, dTime] = request.security(syminfo.tickerid, "D", [open, time], lookahead = barmerge.lookahead_off)
+[wOpen, wTime] = request.security(syminfo.tickerid, "W", [open, time], lookahead = barmerge.lookahead_off)
 
 // ----------------------------------------------------------------------------
 // PHASE 7 — HTF DIRECTIONAL BIAS   [RULES.md "Bias Rules" + MadoCRT HTF read]
@@ -248,10 +315,30 @@ inNy  = useKZny  and not na(time(timeframe.period, "0700-1000:1234567", kzTZ))
 inKZ  = inLon or inNy
 kzOk  = not useKZ or inKZ        // entry allowed? (filter off -> always true)
 
+// --- Day-of-week filter (Step 7) ---
+// RULES.md: Monday = fake high, Thu/Fri = highest conviction Model-1.
+// Uses the bar's own day-of-week (non-repainting).
+dow = dayofweek(time, kzTZ)
+dowOk = if not useDOW
+    true
+else if dowFilter == "any"
+    true
+else if dowFilter == "thu_fri_only"
+    dow == dayofweek.thursday or dow == dayofweek.friday
+else if dowFilter == "tue_fri"
+    dow >= dayofweek.tuesday and dow <= dayofweek.friday
+else if dowFilter == "avoid_monday"
+    dow != dayofweek.monday
+else
+    true
+
+// Combined entry-time filter: kill zone + day-of-week
+entryOk = kzOk and dowOk
+
 bgcolor(showKZbg and inKZ ? color.new(color.blue, 88) : na, title = "Kill Zone")
 
-// Corner HUD: HTF bias (row 0) + current kill-zone status (row 1) — verify aids.
-var table biasTbl = table.new(position.top_center, 1, 2, border_width = 1, border_color = color.new(color.white, 40))
+// Corner HUD: HTF bias (row 0) + kill-zone status (row 1) + DOW filter (row 2)
+var table biasTbl = table.new(position.top_center, 1, 3, border_width = 1, border_color = color.new(color.white, 40))
 if barstate.islast and (showBiasBg or showKZbg)
     bTxt = (biasDir == 1 ? "HTF BIAS: BULLISH ▲" : biasDir == -1 ? "HTF BIAS: BEARISH ▼" : "HTF BIAS: NEUTRAL") + "  (" + biasTF + ")"
     bBg  = biasDir == 1 ? color.green : biasDir == -1 ? color.red : color.gray
@@ -259,6 +346,10 @@ if barstate.islast and (showBiasBg or showKZbg)
     kzTxt = inLon ? "KILL ZONE: LONDON ✓" : inNy ? "KILL ZONE: NEW YORK ✓" : "KILL ZONE: — outside"
     kzBg  = inKZ ? color.blue : color.gray
     table.cell(biasTbl, 0, 1, kzTxt + (useKZ ? "" : "  (filter off)"), text_color = color.white, bgcolor = kzBg, text_size = size.large)
+    dowNames = dow == dayofweek.monday ? "MON" : dow == dayofweek.tuesday ? "TUE" : dow == dayofweek.wednesday ? "WED" : dow == dayofweek.thursday ? "THU" : dow == dayofweek.friday ? "FRI" : dow == dayofweek.saturday ? "SAT" : "SUN"
+    dowTxt = "DAY: " + dowNames + (dowOk ? " ✓" : " ✗")
+    dowBg  = dowOk ? color.teal : color.maroon
+    table.cell(biasTbl, 0, 2, dowTxt + (useDOW ? "" : "  (filter off)"), text_color = color.white, bgcolor = dowBg, text_size = size.large)
 
 // ----------------------------------------------------------------------------
 // State
@@ -294,12 +385,14 @@ var float shortSwingHi      = na     // purge candle HIGH       -> SL for a shor
 var float shortPurgeLow     = na     // purge candle LOW (wick) -> wick entry
 var float shortPurgeBodyLow = na     // purge candle body LOW min(o,c) -> body entry
 var int   shortTsBar        = na     // bar_index of the bearish sweep
+var int   shortLastSweepBar = na     // bar_index of most recent sweep above CRT High
 
 var bool  longActive        = false  // bullish setup pending Model-1
 var float longSwingLo       = na     // purge candle LOW        -> SL for a long
 var float longPurgeHigh     = na     // purge candle HIGH (wick)-> wick entry
 var float longPurgeBodyHigh = na     // purge candle body HIGH max(o,c) -> body entry
 var int   longTsBar         = na     // bar_index of the bullish sweep
+var int   longLastSweepBar  = na     // bar_index of most recent sweep below CRT Low
 
 var line[]  m1Lines = array.new_line()
 var label[] m1Lbls  = array.new_label()
@@ -413,6 +506,53 @@ if newHTF and showRange and validTF and not na(h1)
                  textcolor = midCol, color = color.new(midCol, 90), size = size.tiny)
 
 // ----------------------------------------------------------------------------
+// PHASE 1b — EXTRA CRT TYPES (Steps 5 & 6)
+//   Two-Candle CRT: Candle 1 = range, Candle 2 purges + distributes in one candle.
+//   Inside-Bar CRT: Candle 1 = range, multiple inside bars, then breakout.
+//   These fire as HTF signals alongside the main 3-candle CRT.
+//   RULES.md: "Two Candle CRT: Candle 2 does both jobs — purge AND distribute."
+//   RULES.md: "Inside Bar CRT: Wait for purge of one side → then expansion."
+// ----------------------------------------------------------------------------
+var int  twoCandleState = 0
+var int  twoCandleBar = na
+var int  insideBarState = 0
+var int  insideBarBar = na
+var float insideBarHi = na
+var float insideBarLo = na
+
+if newHTF and validTF
+    twoCandleState := 0
+    twoCandleBar := na
+    insideBarState := 0
+    insideBarBar := na
+    insideBarHi  := na
+    insideBarLo  := na
+    if twoCandleState == 0 and twoCandleBull
+        twoCandleState := 1
+        twoCandleBar := bar_index
+    else if twoCandleState == 0 and twoCandleBear
+        twoCandleState := -1
+        twoCandleBar := bar_index
+    if insideBarState == 0 and insideBarBull
+        insideBarState := 1
+        insideBarBar := bar_index
+        insideBarHi  := insideBarRangeHi
+        insideBarLo  := insideBarRangeLo
+    else if insideBarState == 0 and insideBarBear
+        insideBarState := -1
+        insideBarBar := bar_index
+        insideBarHi  := insideBarRangeHi
+        insideBarLo  := insideBarRangeLo
+
+// Mark 2-Candle CRT on chart
+plotshape(newHTF and twoCandleState == 1 and showRange, title = "2-Candle CRT Bull", style = shape.triangleup, location = location.belowbar, color = color.lime, textcolor = color.lime, size = size.tiny, text = "2C")
+plotshape(newHTF and twoCandleState == -1 and showRange, title = "2-Candle CRT Bear", style = shape.triangledown, location = location.abovebar, color = color.red, textcolor = color.red, size = size.tiny, text = "2C")
+
+// Mark Inside-Bar CRT on chart
+plotshape(newHTF and insideBarState == 1 and showRange, title = "Inside-Bar CRT Bull", style = shape.triangleup, location = location.belowbar, color = color.aqua, textcolor = color.aqua, size = size.tiny, text = "IB")
+plotshape(newHTF and insideBarState == -1 and showRange, title = "Inside-Bar CRT Bear", style = shape.triangledown, location = location.abovebar, color = color.fuchsia, textcolor = color.fuchsia, size = size.tiny, text = "IB")
+
+// ----------------------------------------------------------------------------
 // PHASES 2 & 3 — Turtle Soup -> Model-1 state machine
 //   A setup is born on a turtle-soup sweep and lives (across HTF candles)
 //   until it CONFIRMS (Model-1), INVALIDATES (close beyond the protected
@@ -449,12 +589,16 @@ if active
 if active
     if not shortActive
         // Idle: remember the highest-high (purge) candle above CRT High.
+        // Track sweep recency so a single inside bar between two sweep bars
+        // does NOT wipe the accumulated purge data (Bug #2 fix).
         if high > crtHigh
             if na(shortSwingHi) or high > shortSwingHi
                 shortSwingHi      := high
                 shortPurgeLow     := low
                 shortPurgeBodyLow := math.min(open, close)
-        else
+            shortLastSweepBar := bar_index
+        else if not na(shortSwingHi) and not na(shortLastSweepBar) and (bar_index - shortLastSweepBar) > m1Window
+            // Only wipe if last sweep was stale (> m1Window bars ago)
             shortSwingHi      := na
             shortPurgeLow     := na
             shortPurgeBodyLow := na
@@ -470,15 +614,18 @@ if active
             shortSwingHi      := na
             shortPurgeLow     := na
             shortPurgeBodyLow := na
+            shortLastSweepBar := na
         else if high > shortSwingHi
             shortSwingHi      := high      // deeper buyside sweep -> new purge candle
             shortPurgeLow     := low
             shortPurgeBodyLow := math.min(open, close)
+            shortLastSweepBar := bar_index
         if shortActive and (bar_index - shortTsBar) > m1Window
             shortActive       := false    // timed out
             shortSwingHi      := na
             shortPurgeLow     := na
             shortPurgeBodyLow := na
+            shortLastSweepBar := na
         // Model-1: a later thick DOWN-close candle closes BELOW the purge BODY low.
         // Wick-vs-body (RULES.md MadoCRT EP-2): close beyond the wick low -> wick
         // entry; close only into the body zone (wick low..body low) -> body-low entry.
@@ -493,19 +640,25 @@ if active
                 shortSwingHi      := na
                 shortPurgeLow     := na
                 shortPurgeBodyLow := na
+                shortLastSweepBar := na
 
 // ===== LONG setup (sweep of CRT Low -> expect up) =====
-// Purge candle = the sweep-extreme candle (deepest low). Entry = its HIGH,
-// SL = its LOW. Both track the extreme candle and extend on new lows.
+// Purge candle = the sweep-extreme candle (deepest low). Entry = its HIGH
+// (wick) or body HIGH, SL = its LOW. Both track the extreme candle and extend
+// on new lows.
 if active
     if not longActive
         // Idle: remember the deepest-low (purge) candle below CRT Low.
+        // Track sweep recency so a single inside bar between two sweep bars
+        // does NOT wipe the accumulated purge data (Bug #2 fix).
         if low < crtLow
             if na(longSwingLo) or low < longSwingLo
                 longSwingLo       := low
                 longPurgeHigh     := high
                 longPurgeBodyHigh := math.max(open, close)
-        else
+            longLastSweepBar := bar_index
+        else if not na(longSwingLo) and not na(longLastSweepBar) and (bar_index - longLastSweepBar) > m1Window
+            // Only wipe if last sweep was stale (> m1Window bars ago)
             longSwingLo       := na
             longPurgeHigh     := na
             longPurgeBodyHigh := na
@@ -521,26 +674,33 @@ if active
             longSwingLo       := na
             longPurgeHigh     := na
             longPurgeBodyHigh := na
+            longLastSweepBar  := na
         else if low < longSwingLo
             longSwingLo       := low       // deeper sellside sweep -> new purge candle
             longPurgeHigh     := high
             longPurgeBodyHigh := math.max(open, close)
+            longLastSweepBar  := bar_index
         if longActive and (bar_index - longTsBar) > m1Window
             longActive        := false    // timed out
             longSwingLo       := na
             longPurgeHigh     := na
             longPurgeBodyHigh := na
-        // Model-1: a later thick UP-close candle closes ABOVE the purge candle high.
+            longLastSweepBar  := na
+        // Model-1: a later thick UP-close candle closes ABOVE the purge BODY high.
+        // Wick-vs-body (RULES.md MadoCRT EP-2): close beyond the wick high -> wick
+        // entry; close only into the body zone (body high..wick high) -> body-high entry.
         if longActive and bar_index > longTsBar
             rngL = high - low
             thickL = rngL > 0 and math.abs(close - open) / rngL >= m1MinBody
-            if thickL and close > open and close > longPurgeHigh
+            if thickL and close > open and close > longPurgeBodyHigh
                 m1LongSig     := true
-                m1LongEntry   := longPurgeHigh   // entry = purge candle high
-                m1LongSL      := longSwingLo     // SL    = purge candle low
+                m1LongEntry   := close > longPurgeHigh ? longPurgeHigh : longPurgeBodyHigh
+                m1LongSL      := longSwingLo     // SL    = protected swing low
                 longActive    := false
                 longSwingLo   := na
-                longPurgeHigh := na
+                longPurgeHigh     := na
+                longPurgeBodyHigh := na
+                longLastSweepBar  := na
 
 // ----------------------------------------------------------------------------
 // PHASE 7 — apply the HTF bias gate at the Model-1 (the single arming point).
@@ -553,6 +713,35 @@ if active
 m1LongSig  := m1LongSig  and longBiasOk
 m1ShortSig := m1ShortSig and shortBiasOk
 
+// --- Draw Liquidity Priority filter (Step 4) ---
+// RULES.md Tape Reading: "The draw liquidity is paramount. It comes first."
+// Suppresses setups that trade AGAINST the draw-on-liquidity direction.
+// Auto mode: CRT High = bearish draw (sell toward), CRT Low = bullish draw (buy toward).
+// Manual mode: user sets dlpTarget price. Long allowed when price < target; short when price > target.
+dlpLongOk  = true
+dlpShortOk = true
+if useDLP
+    dlpLevel = dlpAutoFromHTF ? (dlpTarget > 0 ? dlpTarget : na) : (dlpTarget > 0 ? dlpTarget : na)
+    if dlpAutoFromHTF
+        // Auto: CRT Low = bullish draw (buy toward CRT Low from above)
+        //       CRT High = bearish draw (sell toward CRT High from below)
+        dlpLongOk  := not na(crtLow)  and close > crtLow    // price above CRT Low -> long toward CRT Low is wrong way; long toward CRT High is OK
+        dlpShortOk := not na(crtHigh) and close < crtHigh   // price below CRT High -> short toward CRT High is wrong way; short toward CRT Low is OK
+        // Actually: bullish draw = CRT Low (price going UP from CRT Low)
+        //           bearish draw = CRT High (price going DOWN from CRT High)
+        // Long setups aligned: price is near/below CRT Low (buying the dip toward CRT High)
+        // Short setups aligned: price is near/above CRT High (selling the rally toward CRT Low)
+        dlpLongOk  := close <= crtHigh  // allow longs when price hasn't exceeded the bearish draw
+        dlpShortOk := close >= crtLow   // allow shorts when price hasn't broken the bullish draw
+    else if not na(dlpLevel) and dlpLevel > 0
+        dlpLongOk  := close < dlpLevel   // long only when price is below the draw (buying toward target)
+        dlpShortOk := close > dlpLevel   // short only when price is above the draw (selling toward target)
+    else
+        dlpLongOk  := true
+        dlpShortOk := true
+m1LongSig  := m1LongSig  and dlpLongOk
+m1ShortSig := m1ShortSig and dlpShortOk
+
 // --- Turtle-soup markers ---
 plotshape(bearTS and showTS and shortBiasOk, title = "Bearish Turtle Soup", style = shape.triangledown, location = location.abovebar, color = tsBearCol, textcolor = tsBearCol, size = size.small, text = "TS")
 plotshape(bullTS and showTS and longBiasOk,  title = "Bullish Turtle Soup", style = shape.triangleup,   location = location.belowbar, color = tsBullCol, textcolor = tsBullCol, size = size.small, text = "TS")
@@ -561,7 +750,7 @@ plotshape(bullTS and showTS and longBiasOk,  title = "Bullish Turtle Soup", styl
 // Entry-time kill-zone gate (kzOk): the sequence may arm off m1LongSig/m1ShortSig
 // regardless of time, but the *displayed entry* only appears if this bar is in a
 // kill zone. That is why kzOk masks the DISPLAY here, not the signal itself.
-if m1ShortSig and kzOk and showM1 and showEntrySL
+if m1ShortSig and entryOk and showM1 and showEntrySL
     eS = m1ShortEntry    // entry = purge candle low
     sS = m1ShortSL       // SL    = purge candle high
     leS = line.new(bar_index, eS, bar_index + m1LineLen, eS, xloc = xloc.bar_index, color = entryCol, width = 1)
@@ -570,10 +759,14 @@ if m1ShortSig and kzOk and showM1 and showEntrySL
     array.push(m1Lines, lsS)
     lbS = label.new(bar_index + m1LineLen, sS, "SL", xloc = xloc.bar_index, style = label.style_label_left, color = color.new(slCol, 80), textcolor = slCol, size = size.tiny)
     array.push(m1Lbls, lbS)
+    // 50% partial profit target (RULES.md: "Always partial at 50%")
+    halfS = (crtHigh + crtLow) / 2.0
+    l50S = line.new(bar_index, halfS, bar_index + m1LineLen, halfS, xloc = xloc.bar_index, color = midCol, width = 1, style = line.style_dotted)
+    array.push(m1Lines, l50S)
     pruneLinesN(m1Lines, m1KeepN * 2)
     pruneLabelsN(m1Lbls, m1KeepN)
 
-if m1LongSig and kzOk and showM1 and showEntrySL
+if m1LongSig and entryOk and showM1 and showEntrySL
     eL = m1LongEntry     // entry = purge candle high
     sL = m1LongSL        // SL    = purge candle low
     leL = line.new(bar_index, eL, bar_index + m1LineLen, eL, xloc = xloc.bar_index, color = entryCol, width = 1)
@@ -582,11 +775,18 @@ if m1LongSig and kzOk and showM1 and showEntrySL
     array.push(m1Lines, lsL)
     lbL = label.new(bar_index + m1LineLen, sL, "SL", xloc = xloc.bar_index, style = label.style_label_left, color = color.new(slCol, 80), textcolor = slCol, size = size.tiny)
     array.push(m1Lbls, lbL)
+    // 50% partial profit target (RULES.md: "Always partial at 50%")
+    halfL = (crtHigh + crtLow) / 2.0
+    l50L = line.new(bar_index, halfL, bar_index + m1LineLen, halfL, xloc = xloc.bar_index, color = midCol, width = 1, style = line.style_dotted)
+    array.push(m1Lines, l50L)
     pruneLinesN(m1Lines, m1KeepN * 2)
     pruneLabelsN(m1Lbls, m1KeepN)
 
-plotshape(m1ShortSig and kzOk and showM1, title = "Model-1 Short", style = shape.diamond, location = location.abovebar, color = m1BearCol, textcolor = m1BearCol, size = size.tiny, text = "M1")
-plotshape(m1LongSig  and kzOk and showM1, title = "Model-1 Long",  style = shape.diamond, location = location.belowbar, color = m1BullCol, textcolor = m1BullCol, size = size.tiny, text = "M1")
+plotshape(m1ShortSig and entryOk and showM1, title = "Model-1 Short", style = shape.diamond, location = location.abovebar, color = m1BearCol, textcolor = m1BearCol, size = size.tiny, text = "M1")
+plotshape(m1LongSig  and entryOk and showM1, title = "Model-1 Long",  style = shape.diamond, location = location.belowbar, color = m1BullCol, textcolor = m1BullCol, size = size.tiny, text = "M1")
+// FVG-confluence Model-1 (highest probability per RULES.md: "Model-1 + FVG = highest probability")
+plotshape(m1BearHasFVG and entryOk and showM1 and showFVG, title = "M1+FVG Short", style = shape.diamond, location = location.abovebar, color = color.yellow, textcolor = color.yellow, size = size.tiny, text = "M1+F")
+plotshape(m1BullHasFVG and entryOk and showM1 and showFVG, title = "M1+FVG Long",  style = shape.diamond, location = location.belowbar, color = color.yellow, textcolor = color.yellow, size = size.tiny, text = "M1+F")
 
 // ----------------------------------------------------------------------------
 // PHASE 4 — Breaker block / True MSS (retest entry after Model-1 displacement)
@@ -597,7 +797,8 @@ bool brkLongSig  = false
 bool brkShortSig = false
 
 // A Model-1 marks the breaker (last opposite candle before displacement) + zone.
-if m1LongSig and showBreaker and not na(lastDnBar)
+// Step 9: only use if the candidate is within brkWindow bars (recency check).
+if m1LongSig and showBreaker and not na(lastDnBar) and (bar_index - lastDnBar) <= brkWindow
     brkLongActive := true
     brkLongHi  := lastDnHi
     brkLongLo  := lastDnLo
@@ -606,7 +807,7 @@ if m1LongSig and showBreaker and not na(lastDnBar)
     array.push(brkBoxes, bxL)
     pruneBoxesN(brkBoxes, brkKeepN)
 
-if m1ShortSig and showBreaker and not na(lastUpBar)
+if m1ShortSig and showBreaker and not na(lastUpBar) and (bar_index - lastUpBar) <= brkWindow
     brkShortActive := true
     brkShortHi  := lastUpHi
     brkShortLo  := lastUpLo
@@ -622,7 +823,7 @@ if brkLongActive and active
     else if close < brkLongLo
         brkLongActive := false                  // closed through -> breaker failed
     else if bar_index > brkLongBar and low <= brkLongHi
-        brkLongSig    := kzOk                     // retested the breaker zone (entry-time KZ gate)
+        brkLongSig    := entryOk                     // retested the breaker zone (entry-time KZ gate)
         brkLongActive := false
 
 // Bearish breaker retest: price rallies back UP into the zone (resistance).
@@ -632,13 +833,14 @@ if brkShortActive and active
     else if close > brkShortHi
         brkShortActive := false
     else if bar_index > brkShortBar and high >= brkShortLo
-        brkShortSig    := kzOk                    // entry-time KZ gate
+        brkShortSig    := entryOk                    // entry-time KZ gate
         brkShortActive := false
 
 // Draw breaker retest entry / stop-loss.
+// Step 8: entry at the actual retest price (close), not the zone boundary.
 if brkLongSig and showBreaker and showEntrySL
-    eB = brkLongHi          // entry = top of breaker zone
-    sB = brkLongLo          // SL    = bottom of breaker zone
+    eB = close             // entry = retest price (not zone top)
+    sB = brkLongLo         // SL    = bottom of breaker zone
     leB = line.new(bar_index, eB, bar_index + m1LineLen, eB, xloc = xloc.bar_index, color = entryCol, width = 1)
     lsB = line.new(bar_index, sB, bar_index + m1LineLen, sB, xloc = xloc.bar_index, color = slCol, width = 1, style = line.style_dashed)
     array.push(brkLines, leB)
@@ -646,8 +848,8 @@ if brkLongSig and showBreaker and showEntrySL
     pruneLinesN(brkLines, brkKeepN * 2)
 
 if brkShortSig and showBreaker and showEntrySL
-    eB = brkShortLo         // entry = bottom of breaker zone
-    sB = brkShortHi         // SL    = top of breaker zone
+    eB = close             // entry = retest price (not zone bottom)
+    sB = brkShortHi        // SL    = top of breaker zone
     leB = line.new(bar_index, eB, bar_index + m1LineLen, eB, xloc = xloc.bar_index, color = entryCol, width = 1)
     lsB = line.new(bar_index, sB, bar_index + m1LineLen, sB, xloc = xloc.bar_index, color = slCol, width = 1, style = line.style_dashed)
     array.push(brkLines, leB)
@@ -656,6 +858,39 @@ if brkShortSig and showBreaker and showEntrySL
 
 plotshape(brkLongSig  and showBreaker, title = "Breaker Long",  style = shape.square, location = location.belowbar, color = brkMarkCol, textcolor = brkMarkCol, size = size.tiny, text = "BRK")
 plotshape(brkShortSig and showBreaker, title = "Breaker Short", style = shape.square, location = location.abovebar, color = brkMarkCol, textcolor = brkMarkCol, size = size.tiny, text = "BRK")
+
+// ----------------------------------------------------------------------------
+// PHASE 4b — FVG DETECTION (Fair Value Gap)   [RULES.md Key Level Types]
+//   Three-candle imbalance: gap between candle[2] and candle[0] (candle[1]
+//   body is the gap). Bullish FVG = candle[2].high < candle[0].low (gap up).
+//   Bearish FVG = candle[2].low > candle[0].high (gap down).
+//   RULES.md: "Model-1 + FVG = highest probability" setup.
+//   Draws FVG zones as boxes. Also tags Model-1 signals with FVG confluence.
+//   Non-repainting: uses [2] and [0] on confirmed bars only.
+// ----------------------------------------------------------------------------
+var box[] fvgBoxes = array.new_box()
+
+// Detect FVG on confirmed bars (requires bar[2] to be confirmed).
+fvgBullLo = high[2]       // top of the gap (bullish FVG: gap between high[2] and low[0])
+fvgBullHi = low[0]        // bottom of the gap (for bullish, low[0] > high[2])
+fvgBearHi = low[2]        // bottom of the gap (bearish FVG: gap between low[2] and high[0])
+fvgBearLo = high[0]       // top of the gap (for bearish, low[2] > high[0])
+fvgBullActive = active and fvgBullHi > fvgBullLo   // bullish FVG exists
+fvgBearActive = active and fvgBearHi > fvgBearLo   // bearish FVG exists
+
+if fvgBullActive and showFVG
+    bx = box.new(bar_index - 2, fvgBullHi, bar_index + 5, fvgBullLo, xloc = xloc.bar_index, border_color = fvgBullBrdr, bgcolor = fvgBullCol, border_width = 1)
+    array.push(fvgBoxes, bx)
+    pruneBoxesN(fvgBoxes, fvgKeepN)
+
+if fvgBearActive and showFVG
+    bx = box.new(bar_index - 2, fvgBearHi, bar_index + 5, fvgBearLo, xloc = xloc.bar_index, border_color = fvgBearBrdr, bgcolor = fvgBearCol, border_width = 1)
+    array.push(fvgBoxes, bx)
+    pruneBoxesN(fvgBoxes, fvgKeepN)
+
+// Tag Model-1 signals with FVG confluence (highest probability per RULES.md).
+m1BullHasFVG = m1LongSig and fvgBullActive and low <= fvgBullHi and low >= fvgBullLo
+m1BearHasFVG = m1ShortSig and fvgBearActive and high >= fvgBearLo and high <= fvgBearHi
 
 // ----------------------------------------------------------------------------
 // PHASE 5 — OTE (Optimal Trade Entry)   [RULES.md: TSQ Phase 4, RomeoTPT EP7]
@@ -717,7 +952,7 @@ if oteLongActive and active
     else if bar_index - oteLongBar > oteWindow
         oteLongActive := false               // timed out
     else if not newHi and bar_index > oteLongBar and leg > oteMinLeg and low <= zoneTop
-        oteLongSig    := kzOk                                           // entry-time KZ gate
+        oteLongSig    := entryOk                                           // entry-time KZ gate
         oteLongEntry  := oteLegHi - (oteFibHi + oteFibLo) / 2.0 * leg   // OTE mid (~67.5%)
         oteLongSLv    := oteLegLo
         oteLongTgt    := crtHigh
@@ -740,7 +975,7 @@ if oteShortActive and active
     else if bar_index - oteShortBar > oteWindow
         oteShortActive := false
     else if not newLo and bar_index > oteShortBar and legS > oteMinLeg and high >= zoneBotS
-        oteShortSig    := kzOk                                          // entry-time KZ gate
+        oteShortSig    := entryOk                                          // entry-time KZ gate
         oteShortEntry  := oteShortLegLo + (oteFibHi + oteFibLo) / 2.0 * legS
         oteShortSLv    := oteShortLegHi
         oteShortTgt    := crtLow
@@ -849,14 +1084,14 @@ if kodDir != 0 and active
         if kodDir == 1 and not na(lastPivLo)
             locOk = not kodInDiscPrem or close < disc
             if low < lastPivLo and close > lastPivLo and close > open and locOk
-                kodLongSig := kzOk         // entry-time KZ gate (event still recorded below)
+                kodLongSig := entryOk         // entry-time KZ gate (event still recorded below)
                 kodFired   := true          // one KOD per sequence, tradeable or not
                 kodSLv     := low          // risk below the KOD wick
                 kodTgtv    := kodTarget     // reward at CRT High
         else if kodDir == -1 and not na(lastPivHi)
             locOk = not kodInDiscPrem or close > disc
             if high > lastPivHi and close < lastPivHi and close < open and locOk
-                kodShortSig := kzOk         // entry-time KZ gate (event still recorded below)
+                kodShortSig := entryOk         // entry-time KZ gate (event still recorded below)
                 kodFired    := true          // one KOD per sequence, tradeable or not
                 kodSLv      := high         // risk above the KOD wick
                 kodTgtv     := kodTarget      // reward at CRT Low
@@ -875,6 +1110,25 @@ if (kodLongSig or kodShortSig) and showKOD and showEntrySL
 
 plotshape(kodLongSig  and showKOD, title = "KOD Long",  style = shape.xcross, location = location.belowbar, color = kodBullCol, textcolor = kodBullCol, size = size.small, text = "KOD")
 plotshape(kodShortSig and showKOD, title = "KOD Short", style = shape.xcross, location = location.abovebar, color = kodBearCol, textcolor = kodBearCol, size = size.small, text = "KOD")
+
+// ----------------------------------------------------------------------------
+// PHASE 8 — Reference Levels (Step 12)
+//   RULES.md: "Weekly candle open = Sunday 5:00 PM NY time"
+//   RULES.md: "Daily candle open = Monday midnight NY time"
+//   Plots the current week/day opening price as reference lines.
+//   Non-repainting: uses request.security with [1] (last closed period open).
+// ----------------------------------------------------------------------------
+var line wkOpenLine = na
+var line dayOpenLine = na
+if barstate.islast
+    line.delete(wkOpenLine)
+    line.delete(dayOpenLine)
+    if showWkOpen and not na(wOpen)
+        wkOpenLine := line.new(bar_index - 50, wOpen, bar_index + 10, wOpen, xloc = xloc.bar_index, color = wkOpenCol, width = 1, style = line.style_dashed)
+        label.new(bar_index + 10, wOpen, "Wk Open", xloc = xloc.bar_index, style = label.style_label_left, color = color.new(wkOpenCol, 80), textcolor = wkOpenCol, size = size.tiny)
+    if showDayOpen and not na(dOpen)
+        dayOpenLine := line.new(bar_index - 50, dOpen, bar_index + 10, dOpen, xloc = xloc.bar_index, color = dayOpenCol, width = 1, style = line.style_dashed)
+        label.new(bar_index + 10, dOpen, "Day Open", xloc = xloc.bar_index, style = label.style_label_left, color = color.new(dayOpenCol, 80), textcolor = dayOpenCol, size = size.tiny)
 
 // ----------------------------------------------------------------------------
 // Warning if the CRT timeframe is not higher than the chart timeframe
