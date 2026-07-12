@@ -51,11 +51,17 @@
 //     - Model-1 is the CONFIRMATION that turns a raw sweep into a trade.
 //     - After a turtle soup, a THICK candle must CLOSE decisively back through
 //       the sweep candle in the reversal direction ("closes confirm").
-//         * Bearish: thick DOWN-close candle closes BELOW the purge candle
-//                    -> SHORT.  Entry = purge candle LOW,  SL = purge candle HIGH.
-//         * Bullish: thick UP-close   candle closes ABOVE the purge candle
-//                    -> LONG.   Entry = purge candle HIGH, SL = purge candle LOW.
+//         * Bearish: thick DOWN-close candle closes BELOW the purge body low
+//                    -> SHORT.  Entry = purge LOW / body LOW, SL = purge HIGH.
+//         * Bullish: thick UP-close   candle closes ABOVE the purge body high
+//                    -> LONG.   Entry = purge HIGH / body HIGH, SL = purge LOW.
 //       (RomeoTPT CRT Secrets EP1: "entry above/below the model-1 candle".)
+//     - Wick-vs-body entry (RULES.md "When to Use Wick vs Body", MadoCRT EP2):
+//       the entry level is the purge candle's BODY edge when the confirming candle
+//       closes only into the body zone, or the WICK extreme when it closes beyond
+//       the wick. Body edge is color-independent: long = max(open,close) = body
+//       high; short = min(open,close) = body low. ("open" alone is wrong on a
+//       green long-purge / red short-purge candle.)
 //     - The setup LIVES ACROSS HTF candles (Candle-2 manipulation may confirm
 //       in Candle-3 — RULES.md: "trade Candle 3"). It ends on confirm / time-out.
 //     - Protected swing = deepest wick of the manipulation, extended up to the
@@ -274,18 +280,26 @@ var label lblMid = na
 // INVALIDATES, or TIMES OUT — it is NOT wiped on the HTF boundary.
 // The SL tracks the PROTECTED SWING: the deepest wick of the manipulation,
 // extended up to the Model-1 candle (handles W-shaped double-bottom reactions).
-// Entry/SL reference the PURGE candle (the sweep-extreme candle):
-//   long  -> entry = purge candle HIGH, SL = purge candle LOW (protected swing)
-//   short -> entry = purge candle LOW,  SL = purge candle HIGH (protected swing)
-var bool  shortActive   = false  // bearish setup pending Model-1
-var float shortSwingHi  = na     // purge candle HIGH  -> SL for a short
-var float shortPurgeLow = na     // purge candle LOW   -> entry (Model-1 must close below)
-var int   shortTsBar    = na     // bar_index of the bearish sweep
+// Entry/SL reference the PURGE candle (the sweep-extreme candle). Entry is placed
+// WICK-vs-BODY per RULES.md (MadoCRT EP-2): a confirming close beyond the purge
+// WICK -> entry at the wick extreme; a close only into the purge BODY (between the
+// body edge and the wick) -> entry at the body edge (tighter, smaller stop). The
+// body edge is color-independent -- max(open,close) for a long, min(open,close)
+// for a short -- so it is correct on both red and green purge candles. SL = the
+// protected swing (deepest wick of the manipulation, extends on new wicks):
+//   long  -> entry = purge HIGH (wick) or body HIGH, SL = purge LOW  (protected)
+//   short -> entry = purge LOW  (wick) or body LOW,  SL = purge HIGH (protected)
+var bool  shortActive       = false  // bearish setup pending Model-1
+var float shortSwingHi      = na     // purge candle HIGH       -> SL for a short
+var float shortPurgeLow     = na     // purge candle LOW (wick) -> wick entry
+var float shortPurgeBodyLow = na     // purge candle body LOW min(o,c) -> body entry
+var int   shortTsBar        = na     // bar_index of the bearish sweep
 
-var bool  longActive    = false  // bullish setup pending Model-1
-var float longSwingLo   = na     // purge candle LOW   -> SL for a long
-var float longPurgeHigh = na     // purge candle HIGH  -> entry (Model-1 must close above)
-var int   longTsBar     = na     // bar_index of the bullish sweep
+var bool  longActive        = false  // bullish setup pending Model-1
+var float longSwingLo       = na     // purge candle LOW        -> SL for a long
+var float longPurgeHigh     = na     // purge candle HIGH (wick)-> wick entry
+var float longPurgeBodyHigh = na     // purge candle body HIGH max(o,c) -> body entry
+var int   longTsBar         = na     // bar_index of the bullish sweep
 
 var line[]  m1Lines = array.new_line()
 var label[] m1Lbls  = array.new_label()
@@ -437,11 +451,13 @@ if active
         // Idle: remember the highest-high (purge) candle above CRT High.
         if high > crtHigh
             if na(shortSwingHi) or high > shortSwingHi
-                shortSwingHi  := high
-                shortPurgeLow := low
+                shortSwingHi      := high
+                shortPurgeLow     := low
+                shortPurgeBodyLow := math.min(open, close)
         else
-            shortSwingHi  := na
-            shortPurgeLow := na
+            shortSwingHi      := na
+            shortPurgeLow     := na
+            shortPurgeBodyLow := na
         // Trigger: swept the high but CLOSED back inside -> bearish turtle soup.
         if high > crtHigh and close < crtHigh and not na(shortSwingHi)
             bearTS      := true
@@ -450,27 +466,33 @@ if active
     else
         // Pending: maintain the purge candle, invalidate, or time out.
         if close > shortSwingHi
-            shortActive   := false       // closed above protected swing -> broken
-            shortSwingHi  := na
-            shortPurgeLow := na
+            shortActive       := false   // closed above protected swing -> broken
+            shortSwingHi      := na
+            shortPurgeLow     := na
+            shortPurgeBodyLow := na
         else if high > shortSwingHi
-            shortSwingHi  := high         // deeper buyside sweep -> new purge candle
-            shortPurgeLow := low
+            shortSwingHi      := high      // deeper buyside sweep -> new purge candle
+            shortPurgeLow     := low
+            shortPurgeBodyLow := math.min(open, close)
         if shortActive and (bar_index - shortTsBar) > m1Window
-            shortActive   := false        // timed out
-            shortSwingHi  := na
-            shortPurgeLow := na
-        // Model-1: a later thick DOWN-close candle closes BELOW the purge candle low.
+            shortActive       := false    // timed out
+            shortSwingHi      := na
+            shortPurgeLow     := na
+            shortPurgeBodyLow := na
+        // Model-1: a later thick DOWN-close candle closes BELOW the purge BODY low.
+        // Wick-vs-body (RULES.md MadoCRT EP-2): close beyond the wick low -> wick
+        // entry; close only into the body zone (wick low..body low) -> body-low entry.
         if shortActive and bar_index > shortTsBar
             rngS = high - low
             thickS = rngS > 0 and math.abs(close - open) / rngS >= m1MinBody
-            if thickS and close < open and close < shortPurgeLow
-                m1ShortSig    := true
-                m1ShortEntry  := shortPurgeLow   // entry = purge candle low
-                m1ShortSL     := shortSwingHi    // SL    = purge candle high
-                shortActive   := false
-                shortSwingHi  := na
-                shortPurgeLow := na
+            if thickS and close < open and close < shortPurgeBodyLow
+                m1ShortSig        := true
+                m1ShortEntry      := close < shortPurgeLow ? shortPurgeLow : shortPurgeBodyLow
+                m1ShortSL         := shortSwingHi    // SL = protected swing high
+                shortActive       := false
+                shortSwingHi      := na
+                shortPurgeLow     := na
+                shortPurgeBodyLow := na
 
 // ===== LONG setup (sweep of CRT Low -> expect up) =====
 // Purge candle = the sweep-extreme candle (deepest low). Entry = its HIGH,
@@ -480,11 +502,13 @@ if active
         // Idle: remember the deepest-low (purge) candle below CRT Low.
         if low < crtLow
             if na(longSwingLo) or low < longSwingLo
-                longSwingLo   := low
-                longPurgeHigh := high
+                longSwingLo       := low
+                longPurgeHigh     := high
+                longPurgeBodyHigh := math.max(open, close)
         else
-            longSwingLo   := na
-            longPurgeHigh := na
+            longSwingLo       := na
+            longPurgeHigh     := na
+            longPurgeBodyHigh := na
         // Trigger: swept the low but CLOSED back inside -> bullish turtle soup.
         if low < crtLow and close > crtLow and not na(longSwingLo)
             bullTS     := true
@@ -493,16 +517,19 @@ if active
     else
         // Pending: maintain the purge candle, invalidate, or time out.
         if close < longSwingLo
-            longActive    := false        // closed below protected swing -> broken
-            longSwingLo   := na
-            longPurgeHigh := na
+            longActive        := false    // closed below protected swing -> broken
+            longSwingLo       := na
+            longPurgeHigh     := na
+            longPurgeBodyHigh := na
         else if low < longSwingLo
-            longSwingLo   := low          // deeper sellside sweep -> new purge candle
-            longPurgeHigh := high
+            longSwingLo       := low       // deeper sellside sweep -> new purge candle
+            longPurgeHigh     := high
+            longPurgeBodyHigh := math.max(open, close)
         if longActive and (bar_index - longTsBar) > m1Window
-            longActive    := false        // timed out
-            longSwingLo   := na
-            longPurgeHigh := na
+            longActive        := false    // timed out
+            longSwingLo       := na
+            longPurgeHigh     := na
+            longPurgeBodyHigh := na
         // Model-1: a later thick UP-close candle closes ABOVE the purge candle high.
         if longActive and bar_index > longTsBar
             rngL = high - low
