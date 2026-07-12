@@ -216,7 +216,8 @@ dayOpenCol = input.color(color.aqua, "Daily open color", group = grpRef)
      [high[1], low[1], time[1]], lookahead = barmerge.lookahead_off)
 
 htfMs  = timeframe.in_seconds(htfTF) * 1000                 // one HTF candle, in ms
-newHTF = not na(t1) and ta.change(t1) != 0                  // a new HTF candle just completed
+t1Change = ta.change(t1)                                     // non-repainting: assign first
+newHTF = not na(t1) and t1Change != 0                        // a new HTF candle just completed
 
 // Guard: CRT timeframe must be >= chart timeframe for MTF to make sense.
 validTF = timeframe.in_seconds(htfTF) >= timeframe.in_seconds(timeframe.period)
@@ -784,9 +785,6 @@ if m1LongSig and entryOk and showM1 and showEntrySL
 
 plotshape(m1ShortSig and entryOk and showM1, title = "Model-1 Short", style = shape.diamond, location = location.abovebar, color = m1BearCol, textcolor = m1BearCol, size = size.tiny, text = "M1")
 plotshape(m1LongSig  and entryOk and showM1, title = "Model-1 Long",  style = shape.diamond, location = location.belowbar, color = m1BullCol, textcolor = m1BullCol, size = size.tiny, text = "M1")
-// FVG-confluence Model-1 (highest probability per RULES.md: "Model-1 + FVG = highest probability")
-plotshape(m1BearHasFVG and entryOk and showM1 and showFVG, title = "M1+FVG Short", style = shape.diamond, location = location.abovebar, color = color.yellow, textcolor = color.yellow, size = size.tiny, text = "M1+F")
-plotshape(m1BullHasFVG and entryOk and showM1 and showFVG, title = "M1+FVG Long",  style = shape.diamond, location = location.belowbar, color = color.yellow, textcolor = color.yellow, size = size.tiny, text = "M1+F")
 
 // ----------------------------------------------------------------------------
 // PHASE 4 — Breaker block / True MSS (retest entry after Model-1 displacement)
@@ -891,6 +889,10 @@ if fvgBearActive and showFVG
 // Tag Model-1 signals with FVG confluence (highest probability per RULES.md).
 m1BullHasFVG = m1LongSig and fvgBullActive and low <= fvgBullHi and low >= fvgBullLo
 m1BearHasFVG = m1ShortSig and fvgBearActive and high >= fvgBearLo and high <= fvgBearHi
+
+// FVG-confluence Model-1 markers (must be AFTER m1BullHasFVG/m1BearHasFVG declaration)
+plotshape(m1BearHasFVG and entryOk and showM1 and showFVG, title = "M1+FVG Short", style = shape.diamond, location = location.abovebar, color = color.yellow, textcolor = color.yellow, size = size.tiny, text = "M1+F")
+plotshape(m1BullHasFVG and entryOk and showM1 and showFVG, title = "M1+FVG Long",  style = shape.diamond, location = location.belowbar, color = color.yellow, textcolor = color.yellow, size = size.tiny, text = "M1+F")
 
 // ----------------------------------------------------------------------------
 // PHASE 5 — OTE (Optimal Trade Entry)   [RULES.md: TSQ Phase 4, RomeoTPT EP7]
