@@ -175,3 +175,18 @@ choice · ✅ = grounded in RULES.md.
   the range `request.security` to `[h1,l1,t1]` (old `o1/c1/c2` were bias-only). HUD now
   shows the bias TF. ✅ grounded; interpretations B11 (rev), B13 (rev), B18 (new).
   Awaiting chart re-verification.
+- Phase 3 REVISION (2026-07-16): wick-vs-body Model-1 entry added (RULES.md "When to
+  Use Wick vs Body for Entry", MadoCRT EP-2). Previously entry was ALWAYS the purge
+  candle's wick extreme, and confirmation ALWAYS required a close beyond that wick —
+  the missing body tier was why entries looked "late" (e.g. EURUSD 15m 05-Jun: 3h of
+  chop between body low and wick low never confirmed until the 18:00 dump). Now:
+  (a) trigger relaxed to a thick close beyond the purge BODY edge; (b) entry level =
+  wick extreme if the close is beyond the wick, else the body edge. Body edge is
+  COLOR-INDEPENDENT — long: max(open,close) = body high; short: min(open,close) =
+  body low. RULES.md says "Entry at Open (body)", but a literal open is wrong on a
+  green long-purge / red short-purge candle (open sits on the far side of the body);
+  user-confirmed the body-high/body-low generalization is the intended rule. New state:
+  shortPurgeBodyLow / longPurgeBodyHigh, tracked alongside the wick refs everywhere
+  the purge candle moves. SL unchanged (protected swing). ✅ grounded in RULES.md.
+  Awaiting chart re-verification (both tiers: body-zone close → body entry; wick
+  break close → wick entry).
