@@ -108,7 +108,7 @@ m1MinBody   = input.float(0.7, "Model-1 min body % (thickness)", minval = 0.1, m
 m1Window    = input.int(24, "Setup lifetime (bars after sweep)", minval = 1, maxval = 120, group = grpM1,
      tooltip = "How long a turtle-soup setup stays alive waiting for Model-1. A 4H CRT's Candle-3 distribution can take a full HTF candle (16 bars) — 24 gives it room. Persists across HTF candles.")
 m1KeepN     = input.int(20, "Entry/SL sets to keep", minval = 1, maxval = 100, group = grpM1)
-m1LineLen   = input.int(10, "Entry/SL line length (bars)", minval = 2, maxval = 50, group = grpM1)
+m1LineLen   = input.int(50, "Entry/SL line length (bars)", minval = 2, maxval = 200, group = grpM1)
 m1BearCol   = input.color(color.fuchsia, "Model-1 short marker", group = grpM1)
 m1BullCol   = input.color(color.aqua,    "Model-1 long marker",  group = grpM1)
 entryCol    = input.color(color.white,   "Entry line color",     group = grpM1)
@@ -754,15 +754,15 @@ plotshape(bullTS and showTS and longBiasOk,  title = "Bullish Turtle Soup", styl
 if m1ShortSig and entryOk and showM1 and showEntrySL
     eS = m1ShortEntry    // entry = purge candle low
     sS = m1ShortSL       // SL    = purge candle high
-    leS = line.new(bar_index, eS, bar_index + m1LineLen, eS, xloc = xloc.bar_index, color = entryCol, width = 1)
-    lsS = line.new(bar_index, sS, bar_index + m1LineLen, sS, xloc = xloc.bar_index, color = slCol, width = 1, style = line.style_dashed)
+    leS = line.new(bar_index, eS, bar_index + m1LineLen, eS, xloc = xloc.bar_index, color = entryCol, width = 1, extend = extend.right)
+    lsS = line.new(bar_index, sS, bar_index + m1LineLen, sS, xloc = xloc.bar_index, color = slCol, width = 1, style = line.style_dashed, extend = extend.right)
     array.push(m1Lines, leS)
     array.push(m1Lines, lsS)
     lbS = label.new(bar_index + m1LineLen, sS, "SL", xloc = xloc.bar_index, style = label.style_label_left, color = color.new(slCol, 80), textcolor = slCol, size = size.tiny)
     array.push(m1Lbls, lbS)
     // 50% partial profit target (RULES.md: "Always partial at 50%")
     halfS = (crtHigh + crtLow) / 2.0
-    l50S = line.new(bar_index, halfS, bar_index + m1LineLen, halfS, xloc = xloc.bar_index, color = midCol, width = 1, style = line.style_dotted)
+    l50S = line.new(bar_index, halfS, bar_index + m1LineLen, halfS, xloc = xloc.bar_index, color = midCol, width = 1, style = line.style_dotted, extend = extend.right)
     array.push(m1Lines, l50S)
     pruneLinesN(m1Lines, m1KeepN * 2)
     pruneLabelsN(m1Lbls, m1KeepN)
@@ -770,15 +770,15 @@ if m1ShortSig and entryOk and showM1 and showEntrySL
 if m1LongSig and entryOk and showM1 and showEntrySL
     eL = m1LongEntry     // entry = purge candle high
     sL = m1LongSL        // SL    = purge candle low
-    leL = line.new(bar_index, eL, bar_index + m1LineLen, eL, xloc = xloc.bar_index, color = entryCol, width = 1)
-    lsL = line.new(bar_index, sL, bar_index + m1LineLen, sL, xloc = xloc.bar_index, color = slCol, width = 1, style = line.style_dashed)
+    leL = line.new(bar_index, eL, bar_index + m1LineLen, eL, xloc = xloc.bar_index, color = entryCol, width = 1, extend = extend.right)
+    lsL = line.new(bar_index, sL, bar_index + m1LineLen, sL, xloc = xloc.bar_index, color = slCol, width = 1, style = line.style_dashed, extend = extend.right)
     array.push(m1Lines, leL)
     array.push(m1Lines, lsL)
     lbL = label.new(bar_index + m1LineLen, sL, "SL", xloc = xloc.bar_index, style = label.style_label_left, color = color.new(slCol, 80), textcolor = slCol, size = size.tiny)
     array.push(m1Lbls, lbL)
     // 50% partial profit target (RULES.md: "Always partial at 50%")
     halfL = (crtHigh + crtLow) / 2.0
-    l50L = line.new(bar_index, halfL, bar_index + m1LineLen, halfL, xloc = xloc.bar_index, color = midCol, width = 1, style = line.style_dotted)
+    l50L = line.new(bar_index, halfL, bar_index + m1LineLen, halfL, xloc = xloc.bar_index, color = midCol, width = 1, style = line.style_dotted, extend = extend.right)
     array.push(m1Lines, l50L)
     pruneLinesN(m1Lines, m1KeepN * 2)
     pruneLabelsN(m1Lbls, m1KeepN)
@@ -839,8 +839,8 @@ if brkShortActive and active
 if brkLongSig and showBreaker and showEntrySL
     eB = close             // entry = retest price (not zone top)
     sB = brkLongLo         // SL    = bottom of breaker zone
-    leB = line.new(bar_index, eB, bar_index + m1LineLen, eB, xloc = xloc.bar_index, color = entryCol, width = 1)
-    lsB = line.new(bar_index, sB, bar_index + m1LineLen, sB, xloc = xloc.bar_index, color = slCol, width = 1, style = line.style_dashed)
+    leB = line.new(bar_index, eB, bar_index + m1LineLen, eB, xloc = xloc.bar_index, color = entryCol, width = 1, extend = extend.right)
+    lsB = line.new(bar_index, sB, bar_index + m1LineLen, sB, xloc = xloc.bar_index, color = slCol, width = 1, style = line.style_dashed, extend = extend.right)
     array.push(brkLines, leB)
     array.push(brkLines, lsB)
     pruneLinesN(brkLines, brkKeepN * 2)
@@ -848,8 +848,8 @@ if brkLongSig and showBreaker and showEntrySL
 if brkShortSig and showBreaker and showEntrySL
     eB = close             // entry = retest price (not zone bottom)
     sB = brkShortHi        // SL    = top of breaker zone
-    leB = line.new(bar_index, eB, bar_index + m1LineLen, eB, xloc = xloc.bar_index, color = entryCol, width = 1)
-    lsB = line.new(bar_index, sB, bar_index + m1LineLen, sB, xloc = xloc.bar_index, color = slCol, width = 1, style = line.style_dashed)
+    leB = line.new(bar_index, eB, bar_index + m1LineLen, eB, xloc = xloc.bar_index, color = entryCol, width = 1, extend = extend.right)
+    lsB = line.new(bar_index, sB, bar_index + m1LineLen, sB, xloc = xloc.bar_index, color = slCol, width = 1, style = line.style_dashed, extend = extend.right)
     array.push(brkLines, leB)
     array.push(brkLines, lsB)
     pruneLinesN(brkLines, brkKeepN * 2)
@@ -997,9 +997,9 @@ if oteLongSig and showOTE
         array.push(oteLbls, dl)
         pruneLabelsN(oteLbls, oteKeepN)
     if showEntrySL
-        le = line.new(bar_index, oteLongEntry, bar_index + m1LineLen, oteLongEntry, xloc = xloc.bar_index, color = entryCol, width = 1)
-        ls = line.new(bar_index, oteLongSLv,   bar_index + m1LineLen, oteLongSLv,   xloc = xloc.bar_index, color = slCol,  width = 1, style = line.style_dashed)
-        lt = line.new(bar_index, oteLongTgt,   bar_index + m1LineLen, oteLongTgt,   xloc = xloc.bar_index, color = tgtCol, width = 1, style = line.style_dotted)
+        le = line.new(bar_index, oteLongEntry, bar_index + m1LineLen, oteLongEntry, xloc = xloc.bar_index, color = entryCol, width = 1, extend = extend.right)
+        ls = line.new(bar_index, oteLongSLv,   bar_index + m1LineLen, oteLongSLv,   xloc = xloc.bar_index, color = slCol,  width = 1, style = line.style_dashed, extend = extend.right)
+        lt = line.new(bar_index, oteLongTgt,   bar_index + m1LineLen, oteLongTgt,   xloc = xloc.bar_index, color = tgtCol, width = 1, style = line.style_dotted, extend = extend.right)
         array.push(oteLines, le)
         array.push(oteLines, ls)
         array.push(oteLines, lt)
@@ -1014,9 +1014,9 @@ if oteShortSig and showOTE
         array.push(oteLbls, dl)
         pruneLabelsN(oteLbls, oteKeepN)
     if showEntrySL
-        le = line.new(bar_index, oteShortEntry, bar_index + m1LineLen, oteShortEntry, xloc = xloc.bar_index, color = entryCol, width = 1)
-        ls = line.new(bar_index, oteShortSLv,   bar_index + m1LineLen, oteShortSLv,   xloc = xloc.bar_index, color = slCol,  width = 1, style = line.style_dashed)
-        lt = line.new(bar_index, oteShortTgt,   bar_index + m1LineLen, oteShortTgt,   xloc = xloc.bar_index, color = tgtCol, width = 1, style = line.style_dotted)
+        le = line.new(bar_index, oteShortEntry, bar_index + m1LineLen, oteShortEntry, xloc = xloc.bar_index, color = entryCol, width = 1, extend = extend.right)
+        ls = line.new(bar_index, oteShortSLv,   bar_index + m1LineLen, oteShortSLv,   xloc = xloc.bar_index, color = slCol,  width = 1, style = line.style_dashed, extend = extend.right)
+        lt = line.new(bar_index, oteShortTgt,   bar_index + m1LineLen, oteShortTgt,   xloc = xloc.bar_index, color = tgtCol, width = 1, style = line.style_dotted, extend = extend.right)
         array.push(oteLines, le)
         array.push(oteLines, ls)
         array.push(oteLines, lt)
@@ -1104,8 +1104,8 @@ if kodDir != 0 and active
 
 // Draw KOD stop / target lines.
 if (kodLongSig or kodShortSig) and showKOD and showEntrySL
-    ls = line.new(bar_index, kodSLv,  bar_index + m1LineLen, kodSLv,  xloc = xloc.bar_index, color = slCol,  width = 1, style = line.style_dashed)
-    lt = line.new(bar_index, kodTgtv, bar_index + m1LineLen, kodTgtv, xloc = xloc.bar_index, color = tgtCol, width = 1, style = line.style_dotted)
+    ls = line.new(bar_index, kodSLv,  bar_index + m1LineLen, kodSLv,  xloc = xloc.bar_index, color = slCol,  width = 1, style = line.style_dashed, extend = extend.right)
+    lt = line.new(bar_index, kodTgtv, bar_index + m1LineLen, kodTgtv, xloc = xloc.bar_index, color = tgtCol, width = 1, style = line.style_dotted, extend = extend.right)
     array.push(kodLines, ls)
     array.push(kodLines, lt)
     pruneLinesN(kodLines, kodKeepN * 2)
